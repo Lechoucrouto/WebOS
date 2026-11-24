@@ -1,5 +1,7 @@
+use crate::exec::WboSubsystem;
 use crate::font::glyph_for;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 pub const FB_WIDTH: usize = 1280;
 pub const FB_HEIGHT: usize = 720;
@@ -58,22 +60,18 @@ impl Rect {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AppKind {
-    Terminal,
-    Files,
-    SysMon,
-}
-
 pub struct Window {
     pub id: usize,
-    pub kind: AppKind,
+    pub exe_path: String,
+    pub subsystem: WboSubsystem,
     pub title: String,
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
     pub open: bool,
+    pub pinned: bool,
+    pub custom_lines: Vec<String>,
 }
 
 impl Window {
@@ -225,7 +223,6 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_cursor(&mut self, mx: i32, my: i32) {
-        // 12x18 arrow pointer bitmap: 1 = black border, 2 = white fill
         #[rustfmt::skip]
         const CURSOR: [[u8; 12]; 18] = [
             [1,0,0,0,0,0,0,0,0,0,0,0],

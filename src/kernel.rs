@@ -1,10 +1,12 @@
 use crate::allocator::heap_stats;
+use crate::exec::{
+    expand_wbsh_line, format_wbo_inspection, install_system_binaries, WboExecutable, WboSubsystem,
+};
+use crate::fs::FileSystem;
 use crate::gui::{
-    rgba, AppKind, Canvas, Rect, Window, CHAR_H, CHAR_W, FB_HEIGHT, FB_WIDTH, TASKBAR_H,
-    TITLEBAR_H,
+    rgba, Canvas, Rect, Window, CHAR_H, CHAR_W, FB_HEIGHT, FB_WIDTH, TASKBAR_H, TITLEBAR_H,
 };
 use crate::hal::Hardware;
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -16,6 +18,7 @@ const TERM_ROWS: usize = 19;
 pub struct Kernel {
     framebuffer: Vec<u32>,
     windows: Vec<Window>,
+    next_win_id: usize,
     dragging_win_id: Option<usize>,
     drag_offset_x: i32,
     drag_offset_y: i32,
@@ -30,65 +33,23 @@ pub struct Kernel {
     term_bg: u32,
     input_buffer: String,
 
-    // Virtual filesystem & File Explorer state
-    vfs: BTreeMap<String, String>,
-    selected_file: Option<String>,
+    // Hierarchical C:/ Filesystem & Explorer state
+    fs: FileSystem,
+    explorer_dir: String,
+    selected_path: Option<String>,
 
     boot_time_ms: u64,
 }
 
 impl Kernel {
     pub fn boot(hw: &dyn Hardware) -> Self {
-        let mut vfs = BTreeMap::new();
-        vfs.insert(
-            String::from("readme.txt"),
-            String::from("Welcome to WebOS Desktop! Drag titlebars, click taskbar buttons, or use the terminal."),
-        );
-        vfs.insert(
-            String::from("arch.info"),
-            String::from("Kernel: #![no_std] Rust | Target: wasm32-unknown-unknown | GUI: 1280x720 RGBA"),
-        );
-        vfs.insert(
-            String::from("notes.md"),
-            String::from("Try running: write todo.txt Hello GUI! -- then click Files on the taskbar."),
-        );
-
-        let windows = vec![
-            Window {
-                id: 1,
-                kind: AppKind::Terminal,
-                title: String::from("Terminal - ferrios"),
-                x: 44,
-                y: 44,
-                w: 720,
-                h: 440,
-                open: true,
-            },
-            Window {
-                id: 2,
-                kind: AppKind::Files,
-                title: String::from("File Explorer (/vfs)"),
-                x: 790,
-                y: 64,
-                w: 446,
-                h: 320,
-                open: true,
-            },
-            Window {
-                id: 3,
-                kind: AppKind::SysMon,
-                title: String::from("System Monitor"),
-                x: 790,
-                y: 408,
-                w: 446,
-                h: 240,
-                open: true,
-            },
-        ];
+        let mut fs = FileSystem::new();
+        install_system_binaries(&mut fs);
 
         let mut kernel = Self {
             framebuffer: vec![rgba(14, 19, 27); FB_WIDTH * FB_HEIGHT],
-            windows,
+            windows: Vec::new(),
+            next_win_id: 1,
             dragging_win_id: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
@@ -100,19 +61,29 @@ impl Kernel {
             term_fg: rgba(88, 242, 132),
             term_bg: rgba(13, 17, 23),
             input_buffer: String::new(),
-            vfs,
-            selected_file: Some(String::from("readme.txt")),
+            fs,
+            explorer_dir: String::from("C:/usr"),
+            selected_path: Some(String::from("C:/usr/readme.txt")),
             boot_time_ms: hw.uptime_ms(),
         };
 
-        // Bring Terminal to front initially
-        kernel.focus_window(1);
-        hw.serial_log("[WebOS] Graphical desktop booted.");
-        kernel.println("WebOS Desktop v0.2.0 (#![no_std] Rust)");
-        kernel.println("Type 'help' for commands or click windows.");
+        // Boot startup executables from C:/WebOS/bin/Apps/
+        let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Files.wbo", Some((790, 56)));
+        let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/SysMon.wbo", Some((790, 410)));
+        let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Terminal.wbo", Some((44, 44)));
+
+        hw.serial_log("[WebOS] Booted C:/ filesystem, .wbo loader, and .wbsh shell.");
+        kernel.println("WebOS v0.3.0 (#![no_std] Rust)");
+        kernel.println("Apps: C:/WebOS/bin/Apps/*.wbo | PATH: C:/WebOS/bin/PATH/*.wbsh");
+        kernel.println("Type 'help' for commands.");
         kernel.println("");
-        kernel.print("ferrios> ");
+        kernel.print_prompt();
         kernel
+    }
+
+    fn print_prompt(&mut self) {
+        let prompt = format!("{}> ", self.fs.cwd);
+        self.print(&prompt);
     }
 
     fn focus_window(&mut self, id: usize) {
@@ -123,13 +94,59 @@ impl Kernel {
         }
     }
 
-    fn toggle_or_open_app(&mut self, kind: AppKind) {
-        if let Some(pos) = self.windows.iter().position(|w| w.kind == kind) {
-            let is_top_and_open = self.windows[pos].open && pos == self.windows.len() - 1;
-            if is_top_and_open {
+    pub fn exec_wbo(&mut self, path: &str, pos_override: Option<(i32, i32)>) -> Result<(), String> {
+        let resolved = self.fs.resolve_path(path);
+        let bytes = self
+            .fs
+            .read_bytes(&resolved)
+            .ok_or_else(|| format!("Executable not found: {}", resolved))?
+            .to_vec();
+
+        let exe = WboExecutable::parse(&bytes).map_err(|e| format!("{}: {}", resolved, e))?;
+
+        // If an instance of this executable is already loaded, focus and re-open it
+        if let Some(existing_id) = self
+            .windows
+            .iter()
+            .find(|w| w.exe_path == resolved)
+            .map(|w| w.id)
+        {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == existing_id) {
+                w.title = exe.title;
+                w.custom_lines = exe.body_lines;
+            }
+            self.focus_window(existing_id);
+            return Ok(());
+        }
+
+        let id = self.next_win_id;
+        self.next_win_id += 1;
+        let offset = ((id as i32) * 28) % 160;
+        let (x, y) = pos_override.unwrap_or((140 + offset, 80 + offset));
+
+        self.windows.push(Window {
+            id,
+            exe_path: resolved,
+            subsystem: exe.subsystem,
+            title: exe.title,
+            x,
+            y,
+            w: exe.width,
+            h: exe.height,
+            open: true,
+            pinned: exe.pinned,
+            custom_lines: exe.body_lines,
+        });
+
+        Ok(())
+    }
+
+    fn toggle_taskbar_window(&mut self, id: usize) {
+        if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
+            let is_top_open = self.windows[pos].open && pos == self.windows.len() - 1;
+            if is_top_open {
                 self.windows[pos].open = false;
             } else {
-                let id = self.windows[pos].id;
                 self.focus_window(id);
             }
         }
@@ -155,54 +172,58 @@ impl Kernel {
             return;
         }
 
-        // 1. Check bottom taskbar clicks
+        // 1. Check bottom taskbar buttons (sorted by window id for stable positions)
         if y >= FB_HEIGHT as i32 - TASKBAR_H {
             let btn_y = FB_HEIGHT as i32 - TASKBAR_H + 5;
             let btn_h = TASKBAR_H - 10;
             if y >= btn_y && y < btn_y + btn_h {
-                if (128..252).contains(&x) {
-                    self.toggle_or_open_app(AppKind::Terminal);
-                } else if (262..374).contains(&x) {
-                    self.toggle_or_open_app(AppKind::Files);
-                } else if (384..508).contains(&x) {
-                    self.toggle_or_open_app(AppKind::SysMon);
+                let mut taskbar_wins: Vec<(usize, bool)> = self
+                    .windows
+                    .iter()
+                    .filter(|w| w.pinned || w.open)
+                    .map(|w| (w.id, true))
+                    .collect();
+                taskbar_wins.sort_by_key(|(id, _)| *id);
+
+                let mut bx = 128;
+                for (win_id, _) in taskbar_wins {
+                    if x >= bx && x < bx + 132 {
+                        self.toggle_taskbar_window(win_id);
+                        return;
+                    }
+                    bx += 140;
                 }
             }
             return;
         }
 
-        // 2. Hit-test open windows from top-most (end of Vec) to bottom
-        let mut clicked_win_id = None;
-        let mut close_clicked = false;
-        let mut titlebar_clicked = false;
-        let mut win_origin = (0, 0);
-        let mut clicked_kind = AppKind::Terminal;
-        let mut client_origin = (0, 0);
-
+        // 2. Hit-test open windows from top to bottom
+        let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool)> = None;
         for win in self.windows.iter().rev() {
             if !win.open {
                 continue;
             }
             if win.frame_rect().contains(x, y) {
-                clicked_win_id = Some(win.id);
-                clicked_kind = win.kind;
-                win_origin = (win.x, win.y);
-                let client = win.client_rect();
-                client_origin = (client.x, client.y);
-
-                if win.close_btn_rect().contains(x, y) {
-                    close_clicked = true;
-                } else if win.titlebar_rect().contains(x, y) {
-                    titlebar_clicked = true;
-                }
+                hit = Some((
+                    win.id,
+                    win.subsystem,
+                    (win.x, win.y),
+                    win.client_rect(),
+                    win.close_btn_rect().contains(x, y),
+                    win.titlebar_rect().contains(x, y),
+                ));
                 break;
             }
         }
 
-        if let Some(id) = clicked_win_id {
+        if let Some((id, subsystem, win_origin, client, close_clicked, titlebar_clicked)) = hit {
             if close_clicked {
-                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                    w.open = false;
+                if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
+                    if self.windows[pos].pinned {
+                        self.windows[pos].open = false;
+                    } else {
+                        self.windows.remove(pos);
+                    }
                 }
                 return;
             }
@@ -213,14 +234,65 @@ impl Kernel {
                 self.dragging_win_id = Some(id);
                 self.drag_offset_x = x - win_origin.0;
                 self.drag_offset_y = y - win_origin.1;
-            } else if clicked_kind == AppKind::Files {
-                // Check if user clicked a file row inside File Explorer
-                let rel_y = y - client_origin.1 - 32;
-                if rel_y >= 0 {
-                    let row_idx = (rel_y / 22) as usize;
-                    let file_name = self.vfs.keys().nth(row_idx).cloned();
-                    if file_name.is_some() {
-                        self.selected_file = file_name;
+            } else if subsystem == WboSubsystem::Files {
+                self.handle_files_click(x, y, client);
+            }
+        }
+    }
+
+    fn handle_files_click(&mut self, x: i32, y: i32, client: Rect) {
+        // [Up] button at top-right of File Explorer
+        let up_btn = Rect::new(client.x + client.w - 58, client.y + 5, 50, 20);
+        if up_btn.contains(x, y) {
+            self.explorer_dir = FileSystem::parent_of(&self.explorer_dir);
+            self.selected_path = None;
+            return;
+        }
+
+        // [Run] button in preview panel
+        let preview_y = client.y + client.h - 106;
+        let run_btn = Rect::new(client.x + client.w - 72, preview_y + 6, 56, 20);
+        if run_btn.contains(x, y) {
+            if let Some(sel) = self.selected_path.clone() {
+                if sel.ends_with(".wbo") {
+                    if let Err(err) = self.exec_wbo(&sel, None) {
+                        self.println(&format!("\nExec error: {}", err));
+                        self.print_prompt();
+                    }
+                } else if sel.ends_with(".wbsh") {
+                    self.println("");
+                    self.run_wbsh_file(&sel, &[]);
+                    self.print_prompt();
+                    if let Some(tid) = self
+                        .windows
+                        .iter()
+                        .find(|w| w.subsystem == WboSubsystem::Terminal)
+                        .map(|w| w.id)
+                    {
+                        self.focus_window(tid);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Directory / file rows
+        let rel_y = y - (client.y + 32);
+        if rel_y >= 0 && y < preview_y - 4 {
+            let row_idx = (rel_y / 22) as usize;
+            if let Ok(entries) = self.fs.list_dir(&self.explorer_dir) {
+                if let Some((name, is_dir, _)) = entries.get(row_idx) {
+                    let full_path = if self.explorer_dir == "C:/" {
+                        format!("C:/{}", name)
+                    } else {
+                        format!("{}/{}", self.explorer_dir, name)
+                    };
+
+                    if *is_dir {
+                        self.explorer_dir = full_path;
+                        self.selected_path = None;
+                    } else {
+                        self.selected_path = Some(full_path);
                     }
                 }
             }
@@ -234,11 +306,10 @@ impl Kernel {
     }
 
     pub fn on_key(&mut self, code: u32, hw: &dyn Hardware) {
-        // Route keyboard input to Terminal if it is the active top window
         let terminal_focused = self
             .windows
             .last()
-            .map(|w| w.open && w.kind == AppKind::Terminal)
+            .map(|w| w.open && w.subsystem == WboSubsystem::Terminal)
             .unwrap_or(false);
 
         if !terminal_focused {
@@ -250,8 +321,8 @@ impl Kernel {
                 self.println("");
                 let cmd_line = self.input_buffer.trim().to_string();
                 self.input_buffer.clear();
-                self.execute_command(&cmd_line, hw);
-                self.print("ferrios> ");
+                self.execute_shell_line(&cmd_line, hw);
+                self.print_prompt();
             }
             8 => {
                 if !self.input_buffer.is_empty() {
@@ -264,7 +335,7 @@ impl Kernel {
             }
             32..=126 => {
                 if let Some(ch) = char::from_u32(code) {
-                    if self.input_buffer.len() < TERM_COLS - 10 {
+                    if self.input_buffer.len() < TERM_COLS - 14 {
                         self.input_buffer.push(ch);
                         self.put_char(ch);
                     }
@@ -274,88 +345,225 @@ impl Kernel {
         }
     }
 
-    fn execute_command(&mut self, line: &str, hw: &dyn Hardware) {
+    fn execute_shell_line(&mut self, line: &str, hw: &dyn Hardware) {
         if line.is_empty() {
             return;
         }
 
-        let mut parts = line.splitn(3, ' ');
-        let cmd = parts.next().unwrap_or("");
-        let arg1 = parts.next().unwrap_or("");
-        let arg2 = parts.next().unwrap_or("");
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let cmd = tokens[0];
+        let args = &tokens[1..];
 
+        // 1. Core Shell Intrinsics (must run inside the shell process itself)
         match cmd {
-            "help" => {
-                self.println("Commands: help, ls, cat <f>, write <f> <txt>, rm <f>,");
-                self.println("          open <files|sysmon>, theme <green|amber|cyan>,");
-                self.println("          mem, uptime, clear");
+            "pwd" => {
+                let cwd = self.fs.cwd.clone();
+                self.println(&cwd);
+                return;
             }
-            "open" => match arg1 {
-                "files" => {
-                    if let Some(id) = self.windows.iter().find(|w| w.kind == AppKind::Files).map(|w| w.id) {
-                        self.focus_window(id);
-                    }
+            "cd" => {
+                let target = args.first().copied().unwrap_or("C:/usr");
+                let resolved = self.fs.resolve_path(target);
+                if self.fs.is_dir(&resolved) {
+                    self.fs.cwd = resolved;
+                } else {
+                    self.println(&format!("cd: {}: No such directory", target));
                 }
-                "sysmon" => {
-                    if let Some(id) = self.windows.iter().find(|w| w.kind == AppKind::SysMon).map(|w| w.id) {
-                        self.focus_window(id);
-                    }
-                }
-                _ => self.println("Usage: open <files|sysmon>"),
-            },
-            "uptime" => {
-                let elapsed = hw.uptime_ms().saturating_sub(self.boot_time_ms);
-                self.println(&format!("Uptime: {}.{:03}s", elapsed / 1000, elapsed % 1000));
+                return;
             }
-            "mem" => {
+            "clear" => {
+                self.term_grid.fill(' ');
+                self.cursor_x = 0;
+                self.cursor_y = 0;
+                return;
+            }
+            "run" => {
+                if let Some(target) = args.first() {
+                    let resolved = self.fs.resolve_path(target);
+                    if resolved.ends_with(".wbo") {
+                        if let Err(e) = self.exec_wbo(&resolved, None) {
+                            self.println(&e);
+                        }
+                    } else if resolved.ends_with(".wbsh") {
+                        self.run_wbsh_file(&resolved, &args[1..]);
+                    } else {
+                        self.println("run: file must end in .wbo or .wbsh");
+                    }
+                } else {
+                    self.println("Usage: run <file.wbo | file.wbsh>");
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // 2. Direct path execution (e.g., `./hello.wbsh` or `C:/WebOS/bin/Apps/SysMon.wbo`)
+        if cmd.contains('/') || cmd.contains('\\') || cmd.ends_with(".wbo") || cmd.ends_with(".wbsh") {
+            let resolved = self.fs.resolve_path(cmd);
+            if resolved.ends_with(".wbo") {
+                if let Err(e) = self.exec_wbo(&resolved, None) {
+                    self.println(&e);
+                }
+                return;
+            } else if resolved.ends_with(".wbsh") {
+                self.run_wbsh_file(&resolved, args);
+                return;
+            }
+        }
+
+        // 3. Search C:/WebOS/bin/PATH/<cmd>.wbsh
+        let path_script = format!("C:/WebOS/bin/PATH/{}.wbsh", cmd);
+        if self.fs.read_str(&path_script).is_some() {
+            self.run_wbsh_file(&path_script, args);
+            return;
+        }
+
+        // 4. Search C:/WebOS/bin/Apps/<cmd>.wbo
+        let app_bin = format!("C:/WebOS/bin/Apps/{}.wbo", cmd);
+        if self.fs.read_bytes(&app_bin).is_some() {
+            if let Err(e) = self.exec_wbo(&app_bin, None) {
+                self.println(&e);
+            }
+            return;
+        }
+
+        let _ = hw;
+        self.println(&format!(
+            "wbsh: '{}': not found in C:/WebOS/bin/PATH or Apps",
+            cmd
+        ));
+    }
+
+    fn run_wbsh_file(&mut self, script_path: &str, args: &[&str]) {
+        let script_source = match self.fs.read_str(script_path) {
+            Some(s) => s.to_string(),
+            None => {
+                self.println(&format!("wbsh: cannot open '{}'", script_path));
+                return;
+            }
+        };
+
+        let lines: Vec<String> = script_source.lines().map(|l| l.to_string()).collect();
+        for raw_line in lines {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let expanded = expand_wbsh_line(trimmed, args, &self.fs.cwd);
+            self.execute_wbsh_statement(&expanded);
+        }
+    }
+
+    fn execute_wbsh_statement(&mut self, stmt: &str) {
+        if let Some(msg) = stmt.strip_prefix("echo ") {
+            self.println(msg);
+            return;
+        }
+        if stmt == "echo" {
+            self.println("");
+            return;
+        }
+
+        // Kernel Syscall Bridge invoked by .wbsh scripts
+        let mut parts = stmt.splitn(4, ' ');
+        let syscall = parts.next().unwrap_or("");
+        let a1 = parts.next().unwrap_or("");
+        let a2 = parts.next().unwrap_or("");
+        let a3 = parts.next().unwrap_or("");
+
+        match syscall {
+            "@sys.ls" => {
+                let target = if a1.is_empty() {
+                    self.fs.cwd.clone()
+                } else {
+                    self.fs.resolve_path(a1)
+                };
+                match self.fs.list_dir(&target) {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            self.println("(empty directory)");
+                        }
+                        for (name, is_dir, size) in entries {
+                            if is_dir {
+                                self.println(&format!("  [DIR]  {}/", name));
+                            } else {
+                                self.println(&format!("  [FILE] {:<20} ({} B)", name, size));
+                            }
+                        }
+                    }
+                    Err(e) => self.println(&format!("ls: {}: {}", target, e)),
+                }
+            }
+            "@sys.cat" => {
+                if a1.is_empty() {
+                    self.println("Usage: cat <file>");
+                    return;
+                }
+                let resolved = self.fs.resolve_path(a1);
+                if let Some(bytes) = self.fs.read_bytes(&resolved) {
+                    if resolved.ends_with(".wbo") {
+                        let info = format_wbo_inspection(bytes);
+                        self.println(&info);
+                    } else if let Ok(text) = core::str::from_utf8(bytes) {
+                        let owned = text.to_string();
+                        for l in owned.lines() {
+                            self.println(l);
+                        }
+                    } else {
+                        self.println(&format!("<binary file: {} bytes>", bytes.len()));
+                    }
+                } else {
+                    self.println(&format!("cat: {}: No such file", a1));
+                }
+            }
+            "@sys.write" => {
+                let content = if a3.is_empty() {
+                    a2.to_string()
+                } else {
+                    format!("{} {}", a2, a3)
+                };
+                if a1.is_empty() || content.is_empty() {
+                    self.println("Usage: write <file> <text>");
+                    return;
+                }
+                match self.fs.write_str(a1, &content) {
+                    Ok(()) => self.println(&format!("Wrote {} bytes to {}", content.len(), a1)),
+                    Err(e) => self.println(&format!("write: {}", e)),
+                }
+            }
+            "@sys.mkdir" => {
+                if a1.is_empty() {
+                    self.println("Usage: mkdir <dir>");
+                    return;
+                }
+                match self.fs.mkdir(a1) {
+                    Ok(()) => self.println(&format!("Created directory {}", a1)),
+                    Err(e) => self.println(&format!("mkdir: {}", e)),
+                }
+            }
+            "@sys.rm" => {
+                if a1.is_empty() {
+                    self.println("Usage: rm <path>");
+                    return;
+                }
+                match self.fs.remove(a1) {
+                    Ok(()) => self.println(&format!("Removed {}", a1)),
+                    Err(e) => self.println(&format!("rm: {}", e)),
+                }
+            }
+            "@sys.mem" => {
                 let (used, total) = heap_stats();
                 self.println(&format!(
-                    "Heap: {} / {} KiB ({:.1}%)",
+                    "Kernel Heap: {} / {} KiB ({:.1}%)",
                     used / 1024,
                     total / 1024,
                     (used as f64 / total as f64) * 100.0
                 ));
             }
-            "ls" => {
-                let entries: Vec<String> = self
-                    .vfs
-                    .iter()
-                    .map(|(name, content)| format!("  {:<16} ({} bytes)", name, content.len()))
-                    .collect();
-                for entry in entries {
-                    self.println(&entry);
-                }
+            "@sys.uptime" => {
+                self.println(&format!("Boot Timestamp: {} ms", self.boot_time_ms));
             }
-            "cat" => {
-                if arg1.is_empty() {
-                    self.println("Usage: cat <filename>");
-                } else if let Some(content) = self.vfs.get(arg1) {
-                    let out = content.clone();
-                    self.println(&out);
-                } else {
-                    self.println(&format!("cat: {}: No such file", arg1));
-                }
-            }
-            "write" => {
-                if arg1.is_empty() || arg2.is_empty() {
-                    self.println("Usage: write <filename> <text>");
-                } else {
-                    self.vfs.insert(arg1.to_string(), arg2.to_string());
-                    self.selected_file = Some(arg1.to_string());
-                    self.println(&format!("Wrote {} bytes to '{}'", arg2.len(), arg1));
-                }
-            }
-            "rm" => {
-                if self.vfs.remove(arg1).is_some() {
-                    if self.selected_file.as_deref() == Some(arg1) {
-                        self.selected_file = self.vfs.keys().next().cloned();
-                    }
-                    self.println(&format!("Removed '{}'", arg1));
-                } else {
-                    self.println(&format!("rm: {}: No such file", arg1));
-                }
-            }
-            "theme" => match arg1 {
+            "@sys.theme" => match a1 {
                 "green" => {
                     self.term_fg = rgba(88, 242, 132);
                     self.term_bg = rgba(13, 17, 23);
@@ -370,14 +578,34 @@ impl Kernel {
                 }
                 _ => self.println("Usage: theme <green|amber|cyan>"),
             },
-            "clear" => {
-                self.term_grid.fill(' ');
-                self.cursor_x = 0;
-                self.cursor_y = 0;
+            "@sys.open" => {
+                if a1.is_empty() {
+                    self.println("Usage: open <AppName.wbo>");
+                    return;
+                }
+                let candidate = if a1.contains('/') {
+                    a1.to_string()
+                } else if a1.ends_with(".wbo") {
+                    format!("C:/WebOS/bin/Apps/{}", a1)
+                } else {
+                    format!("C:/WebOS/bin/Apps/{}.wbo", a1)
+                };
+                if let Err(e) = self.exec_wbo(&candidate, None) {
+                    self.println(&e);
+                }
             }
-            _ => {
-                self.println(&format!("Unknown command: '{}'. Type 'help'.", cmd));
+            "@sys.mkwbo" => {
+                if a1.is_empty() || a2.is_empty() || a3.is_empty() {
+                    self.println("Usage: mkwbo <path.wbo> <Title> <BodyText>");
+                    return;
+                }
+                let bin = WboExecutable::pack(WboSubsystem::CustomApp, 420, 210, false, a2, a3);
+                match self.fs.write_bytes(a1, bin) {
+                    Ok(()) => self.println(&format!("Compiled .wbo executable: {}", a1)),
+                    Err(e) => self.println(&format!("mkwbo: {}", e)),
+                }
             }
+            _ => self.println(&format!("wbsh: unknown directive '{}'", syscall)),
         }
     }
 
@@ -420,12 +648,41 @@ impl Kernel {
         let blink_on = (hw.uptime_ms() / 500) % 2 == 0;
         let top_open_id = self.windows.iter().rev().find(|w| w.open).map(|w| w.id);
 
+        // Prepare taskbar list sorted by window ID so button order stays fixed
+        let mut taskbar_items: Vec<(usize, String, bool)> = self
+            .windows
+            .iter()
+            .filter(|w| w.pinned || w.open)
+            .map(|w| {
+                let short_name = w
+                    .exe_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&w.title)
+                    .trim_end_matches(".wbo")
+                    .to_string();
+                (w.id, short_name, w.open)
+            })
+            .collect();
+        taskbar_items.sort_by_key(|(id, _, _)| *id);
+
+        let dir_entries = self.fs.list_dir(&self.explorer_dir).unwrap_or_default();
+        let selected_preview: Option<(String, bool)> = self.selected_path.as_ref().and_then(|p| {
+            let runnable = p.ends_with(".wbo") || p.ends_with(".wbsh");
+            let text = if p.ends_with(".wbo") {
+                self.fs.read_bytes(p).map(format_wbo_inspection)
+            } else {
+                self.fs.read_str(p).map(|s| s.to_string())
+            };
+            text.map(|t| (t, runnable))
+        });
+
         let mut canvas = Canvas::new(&mut self.framebuffer);
 
         // 1. Desktop Wallpaper
         canvas.draw_wallpaper();
 
-        // 2. Render open windows from back to front
+        // 2. Render open windows
         for win in &self.windows {
             if !win.open {
                 continue;
@@ -447,7 +704,6 @@ impl Kernel {
                 rgba(22, 27, 34)
             };
 
-            // Window drop shadow & outer frame
             canvas.reset_clip();
             canvas.fill_rect(
                 Rect::new(frame.x + 5, frame.y + 5, frame.w, frame.h),
@@ -456,7 +712,6 @@ impl Kernel {
             canvas.fill_rect(frame, rgba(16, 21, 29));
             canvas.stroke_rect(frame, border_col);
 
-            // Title bar & Close button
             canvas.set_clip(titlebar);
             canvas.fill_rect(titlebar, title_bg);
             canvas.draw_text(
@@ -475,10 +730,9 @@ impl Kernel {
                 rgba(218, 54, 51),
             );
 
-            // Window App Content
             canvas.set_clip(client);
-            match win.kind {
-                AppKind::Terminal => {
+            match win.subsystem {
+                WboSubsystem::Terminal => {
                     canvas.fill_rect(client, self.term_bg);
                     for r in 0..TERM_ROWS {
                         for c in 0..TERM_COLS {
@@ -506,64 +760,97 @@ impl Kernel {
                         );
                     }
                 }
-                AppKind::Files => {
+                WboSubsystem::Files => {
                     let panel_bg = rgba(16, 21, 29);
                     canvas.fill_rect(client, panel_bg);
+
+                    // Current directory bar & [Up] button
                     canvas.draw_text(
                         client.x + 10,
                         client.y + 8,
-                        "Click a file to preview:",
-                        rgba(139, 148, 158),
+                        &self.explorer_dir,
+                        rgba(86, 212, 255),
                         panel_bg,
                     );
+                    let up_btn = Rect::new(client.x + client.w - 58, client.y + 5, 50, 20);
+                    canvas.fill_rect(up_btn, rgba(33, 44, 61));
+                    canvas.stroke_rect(up_btn, rgba(88, 166, 255));
+                    canvas.draw_text(
+                        up_btn.x + 13,
+                        up_btn.y + 3,
+                        "Up",
+                        rgba(230, 237, 243),
+                        rgba(33, 44, 61),
+                    );
 
-                    for (idx, (name, content)) in self.vfs.iter().enumerate() {
+                    // Folder & file entries
+                    for (idx, (name, is_dir, size)) in dir_entries.iter().enumerate() {
                         let row_y = client.y + 32 + (idx as i32) * 22;
-                        let is_selected = self.selected_file.as_deref() == Some(name.as_str());
+                        let full = if self.explorer_dir == "C:/" {
+                            format!("C:/{}", name)
+                        } else {
+                            format!("{}/{}", self.explorer_dir, name)
+                        };
+                        let is_selected = self.selected_path.as_deref() == Some(full.as_str());
                         let row_bg = if is_selected {
                             rgba(31, 61, 97)
                         } else {
                             panel_bg
                         };
+
                         canvas.fill_rect(
                             Rect::new(client.x + 6, row_y - 2, client.w - 12, 20),
                             row_bg,
                         );
-                        let label = format!("{:<18} {:>5} B", name, content.len());
-                        canvas.draw_text(
-                            client.x + 12,
-                            row_y + 1,
-                            &label,
-                            rgba(230, 237, 243),
-                            row_bg,
-                        );
+                        let label = if *is_dir {
+                            format!("[DIR]  {}/", name)
+                        } else {
+                            format!("       {:<18} {:>4} B", name, size)
+                        };
+                        let fg = if *is_dir {
+                            rgba(255, 184, 77)
+                        } else if name.ends_with(".wbo") || name.ends_with(".wbsh") {
+                            rgba(126, 231, 135)
+                        } else {
+                            rgba(230, 237, 243)
+                        };
+                        canvas.draw_text(client.x + 10, row_y + 1, &label, fg, row_bg);
                     }
 
-                    // Preview box at bottom of File Explorer
-                    let preview_y = client.y + client.h - 110;
+                    // Preview box & [Run] button
+                    let preview_y = client.y + client.h - 106;
                     let preview_rect =
-                        Rect::new(client.x + 8, preview_y, client.w - 16, 100);
+                        Rect::new(client.x + 8, preview_y, client.w - 16, 98);
                     canvas.fill_rect(preview_rect, rgba(11, 15, 21));
                     canvas.stroke_rect(preview_rect, rgba(48, 54, 61));
 
-                    if let Some(sel) = &self.selected_file {
-                        if let Some(body) = self.vfs.get(sel) {
-                            // Wrap preview text across 3 lines (33 chars per line)
-                            for (line_idx, chunk) in body.as_bytes().chunks(33).take(3).enumerate() {
-                                if let Ok(s) = core::str::from_utf8(chunk) {
-                                    canvas.draw_text(
-                                        preview_rect.x + 8,
-                                        preview_rect.y + 10 + (line_idx as i32) * 22,
-                                        s,
-                                        rgba(126, 231, 135),
-                                        rgba(11, 15, 21),
-                                    );
-                                }
+                    if let Some((body, runnable)) = &selected_preview {
+                        if *runnable {
+                            let run_btn = Rect::new(client.x + client.w - 72, preview_y + 6, 56, 20);
+                            canvas.fill_rect(run_btn, rgba(35, 134, 54));
+                            canvas.draw_text(
+                                run_btn.x + 10,
+                                run_btn.y + 3,
+                                "Run",
+                                rgba(255, 255, 255),
+                                rgba(35, 134, 54),
+                            );
+                        }
+
+                        for (line_idx, chunk) in body.as_bytes().chunks(28).take(3).enumerate() {
+                            if let Ok(s) = core::str::from_utf8(chunk) {
+                                canvas.draw_text(
+                                    preview_rect.x + 8,
+                                    preview_rect.y + 10 + (line_idx as i32) * 22,
+                                    s,
+                                    rgba(201, 209, 217),
+                                    rgba(11, 15, 21),
+                                );
                             }
                         }
                     }
                 }
-                AppKind::SysMon => {
+                WboSubsystem::SysMon => {
                     let panel_bg = rgba(16, 21, 29);
                     canvas.fill_rect(client, panel_bg);
 
@@ -579,7 +866,6 @@ impl Kernel {
                         panel_bg,
                     );
 
-                    // Heap Progress Bar
                     let bar_rect = Rect::new(client.x + 12, client.y + 38, client.w - 24, 22);
                     canvas.fill_rect(bar_rect, rgba(11, 15, 21));
                     canvas.stroke_rect(bar_rect, rgba(48, 54, 61));
@@ -592,24 +878,30 @@ impl Kernel {
                     canvas.draw_text(
                         client.x + 12,
                         client.y + 78,
-                        &format!("Active Windows: {} / {}", open_count, self.windows.len()),
+                        &format!("Running .wbo Processes: {}", open_count),
                         rgba(139, 148, 158),
                         panel_bg,
                     );
                     canvas.draw_text(
                         client.x + 12,
                         client.y + 104,
-                        "Display: 1280x720 RGBA @ 60Hz",
-                        rgba(139, 148, 158),
-                        panel_bg,
-                    );
-                    canvas.draw_text(
-                        client.x + 12,
-                        client.y + 130,
-                        "Arch: wasm32-unknown-unknown",
+                        "Exe Format: WBO\\x01 | Shell: .wbsh",
                         rgba(86, 212, 255),
                         panel_bg,
                     );
+                }
+                WboSubsystem::CustomApp => {
+                    let panel_bg = rgba(16, 21, 29);
+                    canvas.fill_rect(client, panel_bg);
+                    for (idx, line) in win.custom_lines.iter().enumerate() {
+                        canvas.draw_text(
+                            client.x + 14,
+                            client.y + 14 + (idx as i32) * 24,
+                            line,
+                            rgba(230, 237, 243),
+                            panel_bg,
+                        );
+                    }
                 }
             }
         }
@@ -621,31 +913,17 @@ impl Kernel {
         canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, TASKBAR_H), tb_bg);
         canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, 1), rgba(48, 54, 61));
 
-        // OS Badge
         canvas.fill_rect(Rect::new(8, tb_y + 5, 108, TASKBAR_H - 10), rgba(35, 134, 54));
-        canvas.draw_text(
-            18,
-            tb_y + 11,
-            "FerriOS",
-            rgba(255, 255, 255),
-            rgba(35, 134, 54),
-        );
+        canvas.draw_text(18, tb_y + 11, "WebOS", rgba(255, 255, 255), rgba(35, 134, 54));
 
-        // Taskbar App Buttons
-        let buttons = [
-            (128, 124, "Terminal", AppKind::Terminal),
-            (262, 112, "Files", AppKind::Files),
-            (384, 124, "SysMon", AppKind::SysMon),
-        ];
-
-        for (bx, bw, label, kind) in buttons {
-            let is_open = self.windows.iter().any(|w| w.kind == kind && w.open);
+        let mut bx = 128;
+        for (_, label, is_open) in taskbar_items {
             let btn_bg = if is_open {
                 rgba(33, 44, 61)
             } else {
                 rgba(16, 21, 29)
             };
-            let btn_rect = Rect::new(bx, tb_y + 5, bw, TASKBAR_H - 10);
+            let btn_rect = Rect::new(bx, tb_y + 5, 132, TASKBAR_H - 10);
             canvas.fill_rect(btn_rect, btn_bg);
             canvas.stroke_rect(
                 btn_rect,
@@ -655,14 +933,12 @@ impl Kernel {
                     rgba(48, 54, 61)
                 },
             );
-            canvas.draw_text(bx + 12, tb_y + 11, label, rgba(230, 237, 243), btn_bg);
+            canvas.draw_text(bx + 10, tb_y + 11, &label, rgba(230, 237, 243), btn_bg);
+            bx += 140;
         }
 
-        // Live Clock on Right
         let total_secs = elapsed_ms / 1000;
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        let clock_str = format!("UP {:02}:{:02}", mins, secs);
+        let clock_str = format!("UP {:02}:{:02}", total_secs / 60, total_secs % 60);
         canvas.draw_text(
             FB_WIDTH as i32 - 122,
             tb_y + 11,
@@ -671,7 +947,7 @@ impl Kernel {
             tb_bg,
         );
 
-        // 4. Mouse Cursor (drawn on top of everything)
+        // 4. Mouse Cursor
         canvas.draw_cursor(self.mouse_x, self.mouse_y);
     }
 

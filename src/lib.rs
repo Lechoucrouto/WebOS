@@ -5,6 +5,8 @@ extern crate alloc;
 mod allocator;
 mod font;
 mod gui;
+mod fs;
+mod exec;
 mod hal;
 mod kernel;
 
