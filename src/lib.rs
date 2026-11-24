@@ -4,14 +4,16 @@ extern crate alloc;
 
 mod allocator;
 mod font;
+mod gui;
 mod hal;
 mod kernel;
 
 use allocator::BumpAllocator;
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
+use gui::{FB_HEIGHT, FB_WIDTH};
 use hal::Hardware;
-use kernel::{Kernel, FB_HEIGHT, FB_WIDTH};
+use kernel::Kernel;
 
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator;
@@ -66,6 +68,21 @@ pub extern "C" fn kernel_boot() {
 #[no_mangle]
 pub extern "C" fn kernel_key_input(code: u32) {
     with_kernel(|k| k.on_key(code, &BrowserHal));
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_mouse_move(x: i32, y: i32) {
+    with_kernel(|k| k.on_mouse_move(x, y));
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_mouse_down(x: i32, y: i32, button: u32) {
+    with_kernel(|k| k.on_mouse_down(x, y, button));
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_mouse_up(x: i32, y: i32, button: u32) {
+    with_kernel(|k| k.on_mouse_up(x, y, button));
 }
 
 #[no_mangle]

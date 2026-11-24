@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>WebOS — Rust #![no_std] OS in WebAssembly</title>
+  <title>WebOS — Rust #![no_std] Desktop in WebAssembly</title>
   <style>
     body {
       margin: 0;
@@ -15,6 +15,7 @@
       align-items: center;
       justify-content: center;
       gap: 12px;
+      user-select: none;
     }
     canvas {
       border: 2px solid #21262d;
@@ -23,6 +24,7 @@
       width: 1280px;
       max-width: 95vw;
       height: auto;
+      cursor: none;
     }
     .hint {
       font-size: 13px;
@@ -32,7 +34,7 @@
 </head>
 <body>
   <canvas id="display"></canvas>
-  <div class="hint">Click the window and type commands (try <code>help</code>, <code>ls</code>, <code>cat readme.txt</code>, <code>mem</code>, <code>theme amber</code>)</div>
+  <div class="hint">Drag window titlebars, click taskbar apps, or click the Terminal window and type <code>help</code></div>
 
   <script>
     async function boot() {
@@ -57,7 +59,6 @@
       const wasm = instance.exports;
       wasmMemory = wasm.memory;
 
-      // Boot the Rust kernel
       wasm.kernel_boot();
 
       const width = wasm.fb_width();
@@ -67,7 +68,29 @@
       canvas.height = height;
       const ctx = canvas.getContext("2d");
 
-      // Forward browser keyboard input to the kernel
+      function mapCoords(e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor(((e.clientX - rect.left) / rect.width) * width);
+        const y = Math.floor(((e.clientY - rect.top) / rect.height) * height);
+        return [x, y];
+      }
+
+      canvas.addEventListener("mousemove", (e) => {
+        const [x, y] = mapCoords(e);
+        wasm.kernel_mouse_move(x, y);
+      });
+
+      canvas.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        const [x, y] = mapCoords(e);
+        wasm.kernel_mouse_down(x, y, e.button);
+      });
+
+      window.addEventListener("mouseup", (e) => {
+        const [x, y] = mapCoords(e);
+        wasm.kernel_mouse_up(x, y, e.button);
+      });
+
       window.addEventListener("keydown", (e) => {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.key === "Enter") {
@@ -82,7 +105,6 @@
         }
       });
 
-      // Render loop: let the kernel draw pixels, then blit Wasm memory to Canvas
       function frame() {
         wasm.kernel_tick();
         const ptr = wasm.fb_ptr();
