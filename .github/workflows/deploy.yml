@@ -1,0 +1,52 @@
+name: Build and Deploy WebOS
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Compile Rust kernel to WebAssembly
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Package static site
+        run: |
+          mkdir -p dist/target/wasm32-unknown-unknown/release
+          cp index.html dist/index.html
+          cp target/wasm32-unknown-unknown/release/ferrios.wasm dist/target/wasm32-unknown-unknown/release/ferrios.wasm
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

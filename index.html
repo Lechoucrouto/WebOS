@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebOS — Rust #![no_std] OS in WebAssembly</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #07090d;
+      color: #c9d1d9;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+    canvas {
+      border: 2px solid #21262d;
+      border-radius: 8px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.75);
+      image-rendering: pixelated;
+      width: 960px;
+      max-width: 95vw;
+      height: auto;
+    }
+    .hint {
+      font-size: 13px;
+      color: #8b949e;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="display"></canvas>
+  <div class="hint">Click the window and type commands (try <code>help</code>, <code>ls</code>, <code>cat readme.txt</code>, <code>mem</code>, <code>theme amber</code>)</div>
+
+  <script>
+    async function boot() {
+      let wasmMemory;
+      const decoder = new TextDecoder("utf-8");
+
+      const importObject = {
+        env: {
+          js_now_ms: () => performance.now(),
+          js_console_log: (ptr, len) => {
+            const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
+            console.log(decoder.decode(bytes));
+          },
+        },
+      };
+
+      const { instance } = await WebAssembly.instantiateStreaming(
+        fetch("./target/wasm32-unknown-unknown/release/ferrios.wasm"),
+        importObject
+      );
+
+      const wasm = instance.exports;
+      wasmMemory = wasm.memory;
+
+      // Boot the Rust kernel
+      wasm.kernel_boot();
+
+      const width = wasm.fb_width();
+      const height = wasm.fb_height();
+      const canvas = document.getElementById("display");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+
+      // Forward browser keyboard input to the kernel
+      window.addEventListener("keydown", (e) => {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === "Enter") {
+          e.preventDefault();
+          wasm.kernel_key_input(13);
+        } else if (e.key === "Backspace") {
+          e.preventDefault();
+          wasm.kernel_key_input(8);
+        } else if (e.key.length === 1) {
+          e.preventDefault();
+          wasm.kernel_key_input(e.key.charCodeAt(0));
+        }
+      });
+
+      // Render loop: let the kernel draw pixels, then blit Wasm memory to Canvas
+      function frame() {
+        wasm.kernel_tick();
+        const ptr = wasm.fb_ptr();
+        const pixels = new Uint8ClampedArray(wasmMemory.buffer, ptr, width * height * 4);
+        ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+        requestAnimationFrame(frame);
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    boot();
+  </script>
+</body>
+</html>
