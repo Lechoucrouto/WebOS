@@ -131,8 +131,13 @@ impl Kernel {
                 ));
             }
             "ls" => {
-                for (name, content) in &self.vfs {
-                    self.println(&format!("  {:<16} ({} bytes)", name, content.len()));
+                let entries: Vec<String> = self
+                    .vfs
+                    .iter()
+                    .map(|(name, content)| format!("  {:<16} ({} bytes)", name, content.len()))
+                    .collect();
+                for entry in entries {
+                    self.println(&entry);
                 }
             }
             "cat" => {
