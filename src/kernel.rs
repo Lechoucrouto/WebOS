@@ -7,16 +7,43 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-pub const FB_WIDTH: usize = 640;
-pub const FB_HEIGHT: usize = 360;
+pub const FB_WIDTH: usize = 1280;
+pub const FB_HEIGHT: usize = 720;
 
-const CHAR_W: usize = 8;
-const CHAR_H: usize = 14;
-const COLS: usize = (FB_WIDTH - 16) / CHAR_W;   // 78 columns
-const ROWS: usize = (FB_HEIGHT - 16) / CHAR_H;  // 24 rows
+const CHAR_W: usize = 14;
+const CHAR_H: usize = 24;
+const COLS: usize = (FB_WIDTH - 32) / CHAR_W;   // 89 columns
+const ROWS: usize = (FB_HEIGHT - 32) / CHAR_H;  // 28 rows
 
 const fn rgba(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | (0xFF << 24)
+}
+
+fn blend_rgba(fg: u32, bg: u32, alpha: u8) -> u32 {
+    let a = alpha as u32;
+    let inv_a = 255 - a;
+
+    let fr = fg & 0xFF;
+    let fg_g = (fg >> 8) & 0xFF;
+    let fb = (fg >> 16) & 0xFF;
+
+    let br = bg & 0xFF;
+    let bg_g = (bg >> 8) & 0xFF;
+    let bb = (bg >> 16) & 0xFF;
+
+    let r = (fr * a + br * inv_a) / 255;
+    let g = (fg_g * a + bg_g * inv_a) / 255;
+    let b = (fb * a + bb * inv_a) / 255;
+
+    r | (g << 8) | (b << 16) | (0xFF << 24)
+}
+
+fn glyph_bit(bitmap: u64, gx: isize, gy: isize) -> bool {
+    if !(0..5).contains(&gx) || !(0..7).contains(&gy) {
+        return false;
+    }
+    let bit_index = (gy as usize) * 5 + (4 - gx as usize);
+    ((bitmap >> bit_index) & 1) == 1
 }
 
 pub struct Kernel {
@@ -41,7 +68,7 @@ impl Kernel {
         );
         vfs.insert(
             String::from("arch.info"),
-            String::from("Target: wasm32-unknown-unknown | Allocator: BumpAllocator (4 MiB)"),
+            String::from("Target: wasm32-unknown-unknown | Allocator: BumpAllocator (16 MiB)"),
         );
 
         let mut kernel = Self {
@@ -67,7 +94,6 @@ impl Kernel {
 
     pub fn on_key(&mut self, code: u32, hw: &dyn Hardware) {
         match code {
-            // Enter
             13 => {
                 self.println("");
                 let cmd_line = self.input_buffer.trim().to_string();
@@ -75,7 +101,6 @@ impl Kernel {
                 self.execute_command(&cmd_line, hw);
                 self.print("ferrios> ");
             }
-            // Backspace
             8 => {
                 if !self.input_buffer.is_empty() {
                     self.input_buffer.pop();
@@ -86,7 +111,6 @@ impl Kernel {
                     }
                 }
             }
-            // Printable ASCII
             32..=126 => {
                 if let Some(ch) = char::from_u32(code) {
                     if self.input_buffer.len() < COLS - 12 {
@@ -224,7 +248,6 @@ impl Kernel {
         if self.cursor_y + 1 < ROWS {
             self.cursor_y += 1;
         } else {
-            // Scroll terminal rows upward by 1 line
             self.text_grid.copy_within(COLS.., 0);
             let last_row_start = (ROWS - 1) * COLS;
             self.text_grid[last_row_start..].fill(' ');
@@ -256,15 +279,39 @@ impl Kernel {
 
     fn draw_glyph(&mut self, col: usize, row: usize, ch: char) {
         let bitmap = glyph_for(ch);
-        let base_x = 8 + col * CHAR_W;
-        let base_y = 8 + row * CHAR_H;
+        let base_x = 16 + col * CHAR_W;
+        let base_y = 16 + row * CHAR_H;
+        let aa_color = blend_rgba(self.fg_color, self.bg_color, 95);
 
-        for gy in 0..7 {
-            for gx in 0..5 {
-                if (bitmap >> (gy * 5 + gx)) & 1 == 1 {
-                    let px = base_x + gx;
-                    let py = base_y + gy;
+        for gy in 0..7isize {
+            for gx in 0..5isize {
+                let px = base_x + (gx as usize) * 2;
+                let py = base_y + (gy as usize) * 2;
+
+                if glyph_bit(bitmap, gx, gy) {
                     self.framebuffer[py * FB_WIDTH + px] = self.fg_color;
+                    self.framebuffer[py * FB_WIDTH + (px + 1)] = self.fg_color;
+                    self.framebuffer[(py + 1) * FB_WIDTH + px] = self.fg_color;
+                    self.framebuffer[(py + 1) * FB_WIDTH + (px + 1)] = self.fg_color;
+                } else {
+                    // Anti-alias diagonal corners with 37% alpha blend
+                    let top = glyph_bit(bitmap, gx, gy - 1);
+                    let bottom = glyph_bit(bitmap, gx, gy + 1);
+                    let left = glyph_bit(bitmap, gx - 1, gy);
+                    let right = glyph_bit(bitmap, gx + 1, gy);
+
+                    if top && left {
+                        self.framebuffer[py * FB_WIDTH + px] = aa_color;
+                    }
+                    if top && right {
+                        self.framebuffer[py * FB_WIDTH + (px + 1)] = aa_color;
+                    }
+                    if bottom && left {
+                        self.framebuffer[(py + 1) * FB_WIDTH + px] = aa_color;
+                    }
+                    if bottom && right {
+                        self.framebuffer[(py + 1) * FB_WIDTH + (px + 1)] = aa_color;
+                    }
                 }
             }
         }
@@ -275,11 +322,11 @@ impl Kernel {
             return;
         }
         let color = if visible { self.fg_color } else { self.bg_color };
-        let base_x = 8 + self.cursor_x * CHAR_W;
-        let base_y = 8 + self.cursor_y * CHAR_H;
+        let base_x = 16 + self.cursor_x * CHAR_W;
+        let base_y = 16 + self.cursor_y * CHAR_H;
 
-        for py in base_y..(base_y + 8) {
-            for px in base_x..(base_x + 5) {
+        for py in base_y..(base_y + 15) {
+            for px in base_x..(base_x + 10) {
                 self.framebuffer[py * FB_WIDTH + px] = color;
             }
         }

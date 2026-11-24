@@ -2,7 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB kernel heap
+const HEAP_SIZE: usize = 16 * 1024 * 1024; // 4 MiB kernel heap
 
 #[repr(align(16))]
 struct HeapStorage(UnsafeCell<[u8; HEAP_SIZE]>);
