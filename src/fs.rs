@@ -22,28 +22,28 @@ impl FileSystem {
 
         // Core directory hierarchy
         fs.nodes.insert(String::from("C:/"), FsNode::Dir);
-        fs.mkdir("C:/usr");
-        fs.mkdir("C:/WebOS");
-        fs.mkdir("C:/WebOS/bin");
-        fs.mkdir("C:/WebOS/bin/PATH");
-        fs.mkdir("C:/WebOS/bin/Apps");
+        let _ = fs.mkdir("C:/usr");
+        let _ = fs.mkdir("C:/WebOS");
+        let _ = fs.mkdir("C:/WebOS/bin");
+        let _ = fs.mkdir("C:/WebOS/bin/PATH");
+        let _ = fs.mkdir("C:/WebOS/bin/Apps");
 
-        // User files in C:/usr/
-        fs.write_str(
+        // User files & sample .wbml app source code in C:/usr/
+        let _ = fs.write_str(
             "C:/usr/readme.txt",
-            "Welcome to WebOS! Programs now live in C:/WebOS/bin/Apps/*.wbo and commands in C:/WebOS/bin/PATH/*.wbsh.",
+            "Welcome to WebOS v0.4.0!\n- Click Files or Editor in the bottom-right WebOS menu.\n- Open counter.wbml in Editor and click 'Build .wbo' to compile your own app!",
         );
-        fs.write_str(
-            "C:/usr/arch.info",
-            "Kernel: #![no_std] Rust | Target: wasm32-unknown-unknown | FS: Hierarchical C:/ VFS",
+        let _ = fs.write_str(
+            "C:/usr/counter.wbml",
+            "app \"Counter\" 340 205\nvar count = 0\nvar step = 1\n\nrect 16 14 304 54 dark\nlabel title 28 24 \"Count: {count}\"\nlabel sub 28 46 \"Step size: {step}\"\n\nbutton inc 16 82 94 34 \"+Step\" {\n    count = count + step\n}\nbutton dec 120 82 94 34 \"-Step\" {\n    count = count - step\n}\nbutton rst 224 82 94 34 \"Reset\" {\n    count = 0\n}\nbutton dbl 16 126 302 30 \"Double Step\" {\n    step = step * 2\n}\n",
         );
-        fs.write_str(
-            "C:/usr/notes.md",
-            "Try: cat C:/WebOS/bin/PATH/help.wbsh  OR  run C:/usr/hello.wbsh",
+        let _ = fs.write_str(
+            "C:/usr/calculator.wbml",
+            "app \"Calculator\" 296 285\nvar acc = 0\nvar cur = 0\nvar op = 0\n\nrect 16 12 260 44 dark\nlabel disp 26 24 \"Val: {cur} (Mem: {acc})\"\n\nbutton b7 16 68 58 34 \"7\" { cur = cur * 10 + 7 }\nbutton b8 82 68 58 36 \"8\" { cur = cur * 10 + 8 }\nbutton b9 148 68 58 36 \"9\" { cur = cur * 10 + 9 }\nbutton bdiv 216 68 60 36 \"/\" { acc = cur; cur = 0; op = 4 }\n\nbutton b4 16 112 58 36 \"4\" { cur = cur * 10 + 4 }\nbutton b5 82 112 58 36 \"5\" { cur = cur * 10 + 5 }\nbutton b6 148 112 58 36 \"6\" { cur = cur * 10 + 6 }\nbutton bmul 216 112 60 36 \"*\" { acc = cur; cur = 0; op = 3 }\n\nbutton b1 16 156 58 36 \"1\" { cur = cur * 10 + 1 }\nbutton b2 82 156 58 36 \"2\" { cur = cur * 10 + 2 }\nbutton b3 148 156 58 36 \"3\" { cur = cur * 10 + 3 }\nbutton bsub 216 156 60 36 \"-\" { acc = cur; cur = 0; op = 2 }\n\nbutton bclr 16 200 58 36 \"C\" { acc = 0; cur = 0; op = 0 }\nbutton b0 82 200 58 36 \"0\" { cur = cur * 10 }\nbutton beq 148 200 58 36 \"=\" {\n    if op == 1 { cur = acc + cur }\n    if op == 2 { cur = acc - cur }\n    if op == 3 { cur = acc * cur }\n    if op == 4 { cur = acc / cur }\n    op = 0\n}\nbutton badd 216 200 60 36 \"+\" { acc = cur; cur = 0; op = 1 }\n",
         );
-        fs.write_str(
+        let _ = fs.write_str(
             "C:/usr/hello.wbsh",
-            "# Sample user shell script\necho Running custom script from C:/usr/hello.wbsh!\n@sys.uptime\n@sys.mem\n",
+            "# Sample WebOS shell script\necho Running hello.wbsh from C:/usr/\n@sys.mem\n",
         );
 
         fs
@@ -86,6 +86,11 @@ impl FileSystem {
         } else {
             format!("C:/{}", parts.join("/"))
         }
+    }
+
+    pub fn exists(&self, path: &str) -> bool {
+        let resolved = self.resolve_path(path);
+        self.nodes.contains_key(&resolved)
     }
 
     pub fn mkdir(&mut self, path: &str) -> Result<(), &'static str> {

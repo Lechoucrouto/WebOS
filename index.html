@@ -34,7 +34,7 @@
 </head>
 <body>
   <canvas id="display"></canvas>
-  <div class="hint">Drag window titlebars, click taskbar apps, or click the Terminal window and type <code>help</code></div>
+  <div class="hint">Click <code>WebOS</code> (bottom-right) or press <code>Win / Super / F1</code> to search &amp; launch apps</div>
 
   <script>
     async function boot() {
@@ -52,7 +52,7 @@
       };
 
       const { instance } = await WebAssembly.instantiateStreaming(
-        fetch("./target/wasm32-unknown-unknown/release/webos.wasm"),
+        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=4"),
         importObject
       );
 
@@ -92,13 +92,36 @@
       });
 
       window.addEventListener("keydown", (e) => {
+        // Windows / Super / Meta key or F1 toggles the WebOS Launcher
+        if (e.key === "Meta" || e.key === "OS" || e.key === "F1") {
+          e.preventDefault();
+          wasm.kernel_key_input(1005);
+          return;
+        }
+
+        // Ctrl+S saves the active file in Code Editor
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+          e.preventDefault();
+          wasm.kernel_key_input(2001);
+          return;
+        }
+
         if (e.ctrlKey || e.metaKey || e.altKey) return;
-        if (e.key === "Enter") {
+
+        const specialKeys = {
+          Backspace: 8,
+          Tab: 9,
+          Enter: 13,
+          Escape: 27,
+          ArrowUp: 1001,
+          ArrowDown: 1002,
+          ArrowLeft: 1003,
+          ArrowRight: 1004,
+        };
+
+        if (specialKeys[e.key] !== undefined) {
           e.preventDefault();
-          wasm.kernel_key_input(13);
-        } else if (e.key === "Backspace") {
-          e.preventDefault();
-          wasm.kernel_key_input(8);
+          wasm.kernel_key_input(specialKeys[e.key]);
         } else if (e.key.length === 1) {
           e.preventDefault();
           wasm.kernel_key_input(e.key.charCodeAt(0));

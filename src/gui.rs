@@ -1,4 +1,4 @@
-use crate::exec::WboSubsystem;
+use crate::exec::{DeclarativeRuntime, WboSubsystem};
 use crate::font::glyph_for;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -60,6 +60,16 @@ impl Rect {
     }
 }
 
+pub struct EditorState {
+    pub file_path: String,
+    pub lines: Vec<String>,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    pub scroll_y: usize,
+    pub status: String,
+    pub built_wbo_path: Option<String>,
+}
+
 pub struct Window {
     pub id: usize,
     pub exe_path: String,
@@ -69,9 +79,8 @@ pub struct Window {
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    pub open: bool,
-    pub pinned: bool,
-    pub custom_lines: Vec<String>,
+    pub editor: Option<EditorState>,
+    pub runtime: Option<DeclarativeRuntime>,
 }
 
 impl Window {
