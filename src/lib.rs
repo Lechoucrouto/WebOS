@@ -10,7 +10,7 @@ mod exec;
 mod hal;
 mod kernel;
 
-use allocator::BumpAllocator;
+use allocator::LinkedListAllocator;
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use gui::{FB_HEIGHT, FB_WIDTH};
@@ -18,7 +18,7 @@ use hal::Hardware;
 use kernel::Kernel;
 
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator;
+static ALLOCATOR: LinkedListAllocator = LinkedListAllocator::new();
 
 #[link(wasm_import_module = "env")]
 extern "C" {
