@@ -16,6 +16,7 @@ use kernel::{Kernel, FB_HEIGHT, FB_WIDTH};
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn js_now_ms() -> f64;
     fn js_console_log(ptr: *const u8, len: usize);
