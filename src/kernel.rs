@@ -1400,7 +1400,7 @@ impl Kernel {
                     canvas.stroke_rounded_rect(w.rect, *radius, *border);
                 }
                 RenderedWidgetKind::Text { text, scale, align, color } => {
-                    let char_step = 5 * scale + scale.max(1);
+                    let char_step = 5 * *scale + (*scale).max(1);
                     let text_w = (text.chars().count() as i32) * char_step;
                     let tx = match align {
                         TextAlign::Left => w.rect.x,
@@ -1599,6 +1599,7 @@ impl Kernel {
         }
 
         // 2. Render Visible Running Windows
+        let total_windows = self.windows.len();
         for win in &mut self.windows {
             if win.minimized {
                 continue;
@@ -1988,7 +1989,7 @@ impl Kernel {
                     canvas.draw_text(
                         client.x + 14,
                         client.y + 82,
-                        &format!("Running Processes: {}", self.windows.len()),
+                        &format!("Running Processes: {}", total_windows),
                         rgba(139, 148, 158),
                         panel_bg,
                     );
