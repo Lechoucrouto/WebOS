@@ -34,6 +34,140 @@ pub fn blend_rgba(fg: u32, bg: u32, alpha: u8) -> u32 {
     r | (g << 8) | (b << 16) | (0xFF << 24)
 }
 
+pub fn draw_win10_button(
+        &mut self,
+        r: Rect,
+        label: &str,
+        hovered: bool,
+        primary: bool,
+        text_color: u32,
+    ) {
+        let (bg, border) = if primary {
+            if hovered {
+                (rgba(24, 144, 240), rgba(96, 180, 255))
+            } else {
+                (rgba(0, 120, 215), rgba(38, 148, 235))
+            }
+        } else if hovered {
+            (rgba(45, 52, 64), rgba(110, 122, 140))
+        } else {
+            (rgba(33, 38, 46), rgba(62, 70, 82))
+        };
+
+        self.fill_rect(r, bg);
+        self.stroke_rect(r, border);
+
+        let tx = r.x + (r.w - (label.len() as i32 * CHAR_W)) / 2;
+        let ty = r.y + (r.h - CHAR_H) / 2;
+        self.draw_text(tx.max(r.x + 6), ty, label, text_color);
+    }
+
+    pub fn draw_win10_window_chrome(
+        &mut self,
+        bounds: Rect,
+        title: &str,
+        focused: bool,
+        maximized: bool,
+        hover_btn: u8, // 0 = none, 1 = min, 2 = max, 3 = close
+    ) {
+        // Subtle 1px drop shadow when not maximized
+        if !maximized {
+            self.fill_rect(
+                Rect::new(bounds.x + 3, bounds.y + 3, bounds.w, bounds.h),
+                rgba(4, 6, 10),
+            );
+        }
+
+        // Main window body
+        self.fill_rect(bounds, rgba(16, 20, 26));
+
+        // Title bar (30px tall)
+        let title_rect = Rect::new(bounds.x, bounds.y, bounds.w, 30);
+        let title_bg = if focused {
+            rgba(24, 31, 42)
+        } else {
+            rgba(19, 23, 30)
+        };
+        self.fill_rect(title_rect, title_bg);
+        self.fill_rect(
+            Rect::new(bounds.x, bounds.y + 29, bounds.w, 1),
+            rgba(46, 54, 66),
+        );
+
+        // Left accent bar in title bar when focused
+        if focused {
+            self.fill_rect(
+                Rect::new(bounds.x, bounds.y, 3, 30),
+                rgba(0, 120, 215),
+            );
+        }
+
+        // Window title text
+        let title_col = if focused {
+            rgba(240, 246, 252)
+        } else {
+            rgba(145, 155, 170)
+        };
+        self.draw_text(bounds.x + 12, bounds.y + 8, title, title_col);
+
+        // Windows 10 caption buttons: Minimize (36px), Maximize (36px), Close (42px)
+        let close_r = Rect::new(bounds.x + bounds.w - 42, bounds.y + 1, 41, 28);
+        let max_r = Rect::new(bounds.x + bounds.w - 78, bounds.y + 1, 36, 28);
+        let min_r = Rect::new(bounds.x + bounds.w - 114, bounds.y + 1, 36, 28);
+
+        // Minimize button
+        if hover_btn == 1 {
+            self.fill_rect(min_r, rgba(44, 52, 64));
+        }
+        self.fill_rect(
+            Rect::new(min_r.x + 13, min_r.y + 15, 10, 1),
+            rgba(220, 226, 234),
+        );
+
+        // Maximize / Restore button
+        if hover_btn == 2 {
+            self.fill_rect(max_r, rgba(44, 52, 64));
+        }
+        if maximized {
+            self.stroke_rect(
+                Rect::new(max_r.x + 15, max_r.y + 9, 8, 8),
+                rgba(220, 226, 234),
+            );
+            self.fill_rect(
+                Rect::new(max_r.x + 13, max_r.y + 11, 8, 8),
+                title_bg,
+            );
+            self.stroke_rect(
+                Rect::new(max_r.x + 13, max_r.y + 11, 8, 8),
+                rgba(220, 226, 234),
+            );
+        } else {
+            self.stroke_rect(
+                Rect::new(max_r.x + 13, max_r.y + 9, 10, 10),
+                rgba(220, 226, 234),
+            );
+        }
+
+        // Close button (Windows 10 signature red hover)
+        if hover_btn == 3 {
+            self.fill_rect(close_r, rgba(232, 17, 35));
+        }
+        let cx = close_r.x + 16;
+        let cy = close_r.y + 10;
+        for d in 0..9 {
+            self.set_pixel(cx + d, cy + d, rgba(240, 245, 250));
+            self.set_pixel(cx + 8 - d, cy + d, rgba(240, 245, 250));
+        }
+
+        // Outer 1px crisp Windows 10 border
+        let border_col = if focused {
+            rgba(0, 120, 215)
+        } else {
+            rgba(52, 60, 72)
+        };
+        self.stroke_rect(bounds, border_col);
+    }
+
 #[derive(Clone, Copy)]
 pub struct Rect {
     pub x: i32,
