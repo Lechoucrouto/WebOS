@@ -1,5 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -15,6 +16,12 @@ static USED_BYTES: AtomicUsize = AtomicUsize::new(0);
 struct FreeNode {
     size: usize,
     next: Option<NonNull<FreeNode>>,
+}
+
+#[repr(C)]
+struct AllocHeader {
+    block_start: usize,
+    block_size: usize,
 }
 
 const fn align_up(addr: usize, align: usize) -> usize {
@@ -47,9 +54,9 @@ impl AllocatorState {
     unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
         self.ensure_init();
 
-        // Keep all allocations and free blocks aligned to at least 16 bytes
         let req_align = layout.align().max(16);
-        let alloc_size = align_up(layout.size().max(16), 16);
+        let payload_size = layout.size().max(16);
+        let header_size = size_of::<AllocHeader>();
 
         let mut prev: Option<NonNull<FreeNode>> = None;
         let mut curr = self.head;
@@ -61,16 +68,20 @@ impl AllocatorState {
             let region_end = region_start + region_size;
             let next_node = (*node_ptr).next;
 
-            let alloc_start = align_up(region_start, req_align);
-            let Some(alloc_end) = alloc_start.checked_add(alloc_size) else {
+            // Leave room for AllocHeader directly before the aligned user pointer
+            let Some(min_user_addr) = region_start.checked_add(header_size) else {
                 return ptr::null_mut();
             };
+            let user_start = align_up(min_user_addr, req_align);
+            let Some(raw_end) = user_start.checked_add(payload_size) else {
+                return ptr::null_mut();
+            };
+            let alloc_end = align_up(raw_end, 16);
 
             if alloc_end <= region_end {
-                let before_size = alloc_start - region_start;
+                let total_consumed = alloc_end - region_start;
                 let after_size = region_end - alloc_end;
 
-                // Keep any trailing free space >= 16 bytes
                 let tail = if after_size >= 16 {
                     let after_ptr = alloc_end as *mut FreeNode;
                     (*after_ptr).size = after_size;
@@ -80,19 +91,23 @@ impl AllocatorState {
                     next_node
                 };
 
-                // Keep any leading alignment gap >= 16 bytes, or unlink this block
-                if before_size >= 16 {
-                    (*node_ptr).size = before_size;
-                    (*node_ptr).next = tail;
+                let final_consumed = if after_size >= 16 {
+                    total_consumed
                 } else {
-                    match prev {
-                        Some(prev_nn) => (*prev_nn.as_ptr()).next = tail,
-                        None => self.head = tail,
-                    }
+                    region_size
+                };
+
+                match prev {
+                    Some(prev_nn) => (*prev_nn.as_ptr()).next = tail,
+                    None => self.head = tail,
                 }
 
-                USED_BYTES.fetch_add(alloc_size, Ordering::Relaxed);
-                return alloc_start as *mut u8;
+                let header_ptr = (user_start - header_size) as *mut AllocHeader;
+                (*header_ptr).block_start = region_start;
+                (*header_ptr).block_size = final_consumed;
+
+                USED_BYTES.fetch_add(final_consumed, Ordering::Relaxed);
+                return user_start as *mut u8;
             }
 
             prev = Some(curr_nn);
@@ -102,18 +117,18 @@ impl AllocatorState {
         ptr::null_mut()
     }
 
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc(&mut self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
         }
 
-        let alloc_size = align_up(layout.size().max(16), 16);
-        USED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
-
-        let freed_start = ptr as usize;
+        let header_ptr = (ptr as usize - size_of::<AllocHeader>()) as *const AllocHeader;
+        let freed_start = (*header_ptr).block_start;
+        let alloc_size = (*header_ptr).block_size;
         let freed_end = freed_start + alloc_size;
 
-        // Find sorted insertion position by memory address
+        USED_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+
         let mut prev: Option<NonNull<FreeNode>> = None;
         let mut curr = self.head;
         while let Some(curr_nn) = curr {
@@ -128,7 +143,6 @@ impl AllocatorState {
         (*freed_ptr).size = alloc_size;
         (*freed_ptr).next = curr;
 
-        // Merge with the next free block if immediately adjacent
         if let Some(curr_nn) = curr {
             let curr_addr = curr_nn.as_ptr() as usize;
             if freed_end == curr_addr {
@@ -137,7 +151,6 @@ impl AllocatorState {
             }
         }
 
-        // Link to previous free block and merge if immediately adjacent
         let freed_nn = NonNull::new_unchecked(freed_ptr);
         match prev {
             None => self.head = Some(freed_nn),

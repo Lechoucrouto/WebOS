@@ -1,12 +1,13 @@
 use crate::allocator::heap_stats;
 use crate::exec::{
     compile_wbml_to_wbo, expand_wbsh_line, format_wbo_inspection, install_system_binaries,
-    UiWidgetKind, WboExecutable, WboSubsystem,
+    parse_wbml_program, ButtonStyle, DeclarativeRuntime, RenderedWidget, RenderedWidgetKind,
+    TextAlign, Value, WboExecutable, WboSubsystem,
 };
 use crate::fs::FileSystem;
 use crate::gui::{
-    rgba, Canvas, EditorState, Rect, Window, CHAR_H, CHAR_W, FB_HEIGHT, FB_WIDTH, TASKBAR_H,
-    TITLEBAR_H,
+    rgba, Canvas, EditorState, IconKind, Rect, Window, CHAR_H, CHAR_W, FB_HEIGHT, FB_WIDTH,
+    TASKBAR_H, TITLEBAR_H,
 };
 use crate::hal::Hardware;
 use alloc::format;
@@ -14,27 +15,34 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-const TERM_COLS: usize = 54;
-const TERM_ROWS: usize = 18;
+const TERM_COLS: usize = 56;
+const TERM_ROWS: usize = 19;
 
-const EDITOR_VISIBLE_ROWS: usize = 17;
-const EDITOR_VISIBLE_COLS: usize = 55;
+fn char_to_byte_idx(s: &str, char_col: usize) -> usize {
+    s.char_indices()
+        .nth(char_col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
+}
+
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
 
 pub struct Kernel {
     framebuffer: Vec<u32>,
     windows: Vec<Window>,
     next_win_id: usize,
     dragging_win_id: Option<usize>,
+    resizing_win_id: Option<usize>,
     drag_offset_x: i32,
     drag_offset_y: i32,
     mouse_x: i32,
     mouse_y: i32,
 
-    // Bottom-right WebOS Launcher Menu
     launcher_open: bool,
     launcher_query: String,
 
-    // Terminal state
     term_grid: Vec<char>,
     cursor_x: usize,
     cursor_y: usize,
@@ -42,7 +50,6 @@ pub struct Kernel {
     term_bg: u32,
     input_buffer: String,
 
-    // Hierarchical C:/ Filesystem & Explorer state
     fs: FileSystem,
     explorer_dir: String,
     selected_path: Option<String>,
@@ -56,10 +63,11 @@ impl Kernel {
         install_system_binaries(&mut fs);
 
         let mut kernel = Self {
-            framebuffer: vec![rgba(14, 19, 27); FB_WIDTH * FB_HEIGHT],
+            framebuffer: vec![rgba(10, 15, 26); FB_WIDTH * FB_HEIGHT],
             windows: Vec::new(),
             next_win_id: 1,
             dragging_win_id: None,
+            resizing_win_id: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
             mouse_x: (FB_WIDTH / 2) as i32,
@@ -70,20 +78,19 @@ impl Kernel {
             cursor_x: 0,
             cursor_y: 0,
             term_fg: rgba(88, 242, 132),
-            term_bg: rgba(13, 17, 23),
+            term_bg: rgba(11, 15, 23),
             input_buffer: String::new(),
             fs,
             explorer_dir: String::from("C:/usr"),
-            selected_path: Some(String::from("C:/usr/counter.wbml")),
+            selected_path: Some(String::from("C:/usr/snake.wbml")),
             boot_time_ms: hw.uptime_ms(),
         };
 
-        // Start with Terminal running (closing it leaves an empty taskbar + WebOS launcher)
-        let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Terminal.wbo", Some((44, 44)));
+        let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Editor.wbo", Some((135, 36)));
 
-        hw.serial_log("[WebOS] Booted v0.4.0 with Launcher, Code Editor, and .wbml compiler.");
-        kernel.println("WebOS v0.4.0 (#![no_std] Rust)");
-        kernel.println("Press Super/Win key or click 'WebOS' (bottom-right) to launch apps.");
+        hw.serial_log("[WebOS] Booted v0.5.0 Glass & Slate + WBML v2 Live Preview.");
+        kernel.println("WebOS v0.5.0 (#![no_std] Rust)");
+        kernel.println("Press Super/Win or click 'WebOS' (bottom-right) to launch apps.");
         kernel.println("Type 'help' for commands.");
         kernel.println("");
         kernel.print_prompt();
@@ -97,7 +104,8 @@ impl Kernel {
 
     fn focus_window(&mut self, id: usize) {
         if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
-            let win = self.windows.remove(pos);
+            let mut win = self.windows.remove(pos);
+            win.minimized = false;
             self.windows.push(win);
         }
     }
@@ -135,7 +143,6 @@ impl Kernel {
 
         let exe = WboExecutable::parse(&bytes).map_err(|e| format!("{}: {}", resolved, e))?;
 
-        // Focus existing singleton system window if already running
         if exe.subsystem != WboSubsystem::DeclarativeApp {
             if let Some(existing_id) = self
                 .windows
@@ -156,8 +163,8 @@ impl Kernel {
 
         let id = self.next_win_id;
         self.next_win_id += 1;
-        let offset = ((id as i32) * 32) % 180;
-        let (x, y) = pos_override.unwrap_or((120 + offset, 64 + offset));
+        let offset = ((id as i32) * 30) % 150;
+        let (x, y) = pos_override.unwrap_or((150 + offset, 48 + offset));
 
         self.windows.push(Window {
             id,
@@ -168,6 +175,9 @@ impl Kernel {
             y,
             w: exe.width,
             h: exe.height,
+            minimized: false,
+            maximized: false,
+            saved_bounds: None,
             editor: editor_state,
             runtime: exe.runtime,
         });
@@ -175,25 +185,51 @@ impl Kernel {
         Ok(())
     }
 
+    fn refresh_editor_live_preview(ed: &mut EditorState) {
+        if !ed.file_path.ends_with(".wbml") {
+            ed.live_runtime = None;
+            return;
+        }
+        let src = ed.lines.join("\n");
+        match parse_wbml_program(&src) {
+            Ok((title, w, h, mut rt)) => {
+                rt.ensure_init();
+                ed.live_title = title;
+                ed.live_size = (w as i32, h as i32);
+                ed.live_runtime = Some(rt);
+                ed.status = String::from("Live Preview OK | Ctrl+S Save | Ctrl+R Run");
+            }
+            Err(err) => {
+                ed.status = format!("Syntax: {}", err);
+            }
+        }
+    }
+
     fn make_editor_state(&self, path: &str) -> EditorState {
         let resolved = self.fs.resolve_path(path);
         let content = self
             .fs
             .read_str(&resolved)
-            .unwrap_or("app \"MyApp\" 340 200\nvar count = 0\nlabel lbl 20 20 \"Count: {count}\"\nbutton btn 20 60 110 32 \"Click Me\" {\n    count = count + 1\n}\n");
+            .unwrap_or("app \"MyApp\" 320 220 {\n    state {\n        count = 0\n    }\n    col pad=16 gap=12 {\n        text \"Count: {count}\" size=lg color=#58F284\n        btn \"Increment\" style=primary { count = count + 1 }\n    }\n}\n");
         let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
         if lines.is_empty() {
             lines.push(String::new());
         }
-        EditorState {
+        let mut ed = EditorState {
             file_path: resolved,
             lines,
             cursor_line: 0,
             cursor_col: 0,
             scroll_y: 0,
-            status: String::from("Ctrl+S to Save | Click 'Build .wbo' for .wbml apps"),
+            status: String::from("Ctrl+S Save | Ctrl+R Run"),
             built_wbo_path: None,
-        }
+            live_runtime: None,
+            live_size: (340, 240),
+            live_title: String::from("Preview"),
+            show_guides: true,
+        };
+        Self::refresh_editor_live_preview(&mut ed);
+        ed
     }
 
     pub fn open_in_editor(&mut self, path: &str) {
@@ -211,7 +247,7 @@ impl Kernel {
             }
             self.focus_window(existing_id);
         } else {
-            let _ = self.exec_wbo("C:/WebOS/bin/Apps/Editor.wbo", Some((260, 70)));
+            let _ = self.exec_wbo("C:/WebOS/bin/Apps/Editor.wbo", Some((140, 42)));
             if let Some(w) = self.windows.last_mut() {
                 w.editor = Some(new_state);
             }
@@ -229,9 +265,40 @@ impl Kernel {
             let res = self.fs.write_str(&path, &content);
             if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
                 match res {
-                    Ok(()) => ed.status = format!("Saved {} ({} bytes)", path, content.len()),
+                    Ok(()) => ed.status = format!("Saved {} ({} B)", path, content.len()),
                     Err(e) => ed.status = format!("Save error: {}", e),
                 }
+            }
+        }
+    }
+
+    fn build_and_run_active_editor(&mut self, auto_run: bool) {
+        self.save_active_editor();
+        let src_path = self
+            .windows
+            .last()
+            .and_then(|w| w.editor.as_ref())
+            .map(|ed| ed.file_path.clone());
+
+        if let Some(path) = src_path {
+            let result = self.compile_wbml_path(&path, None);
+            let mut launch_path = None;
+            if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
+                match result {
+                    Ok(out_wbo) => {
+                        ed.status = format!("Built -> {}", out_wbo);
+                        ed.built_wbo_path = Some(out_wbo.clone());
+                        if auto_run {
+                            launch_path = Some(out_wbo);
+                        }
+                    }
+                    Err(err) => {
+                        ed.status = format!("Compile Error: {}", err);
+                    }
+                }
+            }
+            if let Some(wbo_path) = launch_path {
+                let _ = self.exec_wbo(&wbo_path, None);
             }
         }
     }
@@ -272,20 +339,39 @@ impl Kernel {
 
         if let Some(drag_id) = self.dragging_win_id {
             if let Some(win) = self.windows.iter_mut().find(|w| w.id == drag_id) {
-                let max_x = FB_WIDTH as i32 - 80;
-                let max_y = FB_HEIGHT as i32 - TASKBAR_H - TITLEBAR_H;
-                win.x = (self.mouse_x - self.drag_offset_x).clamp(-win.w + 80, max_x);
-                win.y = (self.mouse_y - self.drag_offset_y).clamp(0, max_y);
+                if !win.maximized {
+                    let max_x = FB_WIDTH as i32 - 80;
+                    let max_y = FB_HEIGHT as i32 - TASKBAR_H - TITLEBAR_H;
+                    win.x = (self.mouse_x - self.drag_offset_x).clamp(-win.w + 80, max_x);
+                    win.y = (self.mouse_y - self.drag_offset_y).clamp(0, max_y);
+                }
+            }
+        } else if let Some(res_id) = self.resizing_win_id {
+            if let Some(win) = self.windows.iter_mut().find(|w| w.id == res_id) {
+                if !win.maximized {
+                    win.w = (self.mouse_x - win.x).clamp(280, FB_WIDTH as i32 - win.x);
+                    win.h = (self.mouse_y - win.y).clamp(180, FB_HEIGHT as i32 - TASKBAR_H - win.y);
+                }
             }
         }
     }
 
     fn launcher_rect(&self) -> Rect {
-        Rect::new(FB_WIDTH as i32 - 352, FB_HEIGHT as i32 - TASKBAR_H - 344, 344, 340)
+        Rect::new(FB_WIDTH as i32 - 360, FB_HEIGHT as i32 - TASKBAR_H - 352, 348, 344)
     }
 
     fn launcher_btn_rect(&self) -> Rect {
-        Rect::new(FB_WIDTH as i32 - 124, FB_HEIGHT as i32 - TASKBAR_H + 5, 116, TASKBAR_H - 10)
+        Rect::new(FB_WIDTH as i32 - 122, FB_HEIGHT as i32 - TASKBAR_H + 6, 112, TASKBAR_H - 12)
+    }
+
+    fn desktop_shortcuts(&self) -> [(&'static str, &'static str, IconKind); 5] {
+        [
+            ("Terminal", "C:/WebOS/bin/Apps/Terminal.wbo", IconKind::Terminal),
+            ("Editor", "C:/WebOS/bin/Apps/Editor.wbo", IconKind::Editor),
+            ("Files", "C:/WebOS/bin/Apps/Files.wbo", IconKind::Files),
+            ("Counter", "C:/WebOS/bin/Apps/Counter.wbo", IconKind::AppBinary),
+            ("Arcade", "C:/WebOS/bin/Apps/Arcade_Runner.wbo", IconKind::AppBinary),
+        ]
     }
 
     pub fn on_mouse_down(&mut self, x: i32, y: i32, button: u32) {
@@ -300,13 +386,13 @@ impl Kernel {
             return;
         }
 
-        // 2. If Launcher Menu is open, check clicks inside it
+        // 2. Launcher Popup
         if self.launcher_open {
             let lrect = self.launcher_rect();
             if lrect.contains(x, y) {
-                let list_top = lrect.y + 78;
+                let list_top = lrect.y + 84;
                 if y >= list_top {
-                    let row = ((y - list_top) / 28) as usize;
+                    let row = ((y - list_top) / 30) as usize;
                     let matches = self.matching_launcher_apps();
                     if let Some((_, exe_path)) = matches.get(row) {
                         let path_clone = exe_path.clone();
@@ -316,37 +402,46 @@ impl Kernel {
                 }
                 return;
             } else {
-                // Clicking outside closes the launcher
                 self.launcher_open = false;
             }
         }
 
-        // 3. Taskbar running app tabs (ONLY currently running windows)
+        // 3. Taskbar running app tabs
         if y >= FB_HEIGHT as i32 - TASKBAR_H {
-            let btn_y = FB_HEIGHT as i32 - TASKBAR_H + 5;
-            let btn_h = TASKBAR_H - 10;
+            let btn_y = FB_HEIGHT as i32 - TASKBAR_H + 6;
+            let btn_h = TASKBAR_H - 12;
             if y >= btn_y && y < btn_y + btn_h {
                 let mut running_ids: Vec<usize> = self.windows.iter().map(|w| w.id).collect();
                 running_ids.sort_unstable();
 
-                let mut bx = 10;
+                let mut bx = 12;
                 for win_id in running_ids {
-                    if bx + 136 > self.launcher_btn_rect().x - 130 {
+                    if bx + 148 > self.launcher_btn_rect().x - 140 {
                         break;
                     }
-                    if x >= bx && x < bx + 132 {
-                        self.focus_window(win_id);
+                    if x >= bx && x < bx + 142 {
+                        let is_top = self.windows.last().map(|w| w.id == win_id && !w.minimized).unwrap_or(false);
+                        if is_top {
+                            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win_id) {
+                                w.minimized = true;
+                            }
+                        } else {
+                            self.focus_window(win_id);
+                        }
                         return;
                     }
-                    bx += 138;
+                    bx += 148;
                 }
             }
             return;
         }
 
-        // 4. Hit-test open windows from top to bottom
-        let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool)> = None;
+        // 4. Hit-test visible open windows from top to bottom
+        let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool, bool, bool, bool)> = None;
         for win in self.windows.iter().rev() {
+            if win.minimized {
+                continue;
+            }
             if win.frame_rect().contains(x, y) {
                 hit = Some((
                     win.id,
@@ -354,24 +449,61 @@ impl Kernel {
                     (win.x, win.y),
                     win.client_rect(),
                     win.close_btn_rect().contains(x, y),
+                    win.max_btn_rect().contains(x, y),
+                    win.min_btn_rect().contains(x, y),
                     win.titlebar_rect().contains(x, y),
+                    win.resize_grip_rect().contains(x, y),
                 ));
                 break;
             }
         }
 
-        if let Some((id, subsystem, win_origin, client, close_clicked, titlebar_clicked)) = hit {
-            if close_clicked {
-                // Closing terminates the running app and removes it from the taskbar
+        if let Some((id, subsystem, win_origin, client, close_hit, max_hit, min_hit, title_hit, resize_hit)) = hit {
+            if close_hit {
                 if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
                     self.windows.remove(pos);
                 }
                 return;
             }
 
+            if min_hit {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    w.minimized = true;
+                }
+                return;
+            }
+
+            if max_hit {
+                self.focus_window(id);
+                if let Some(w) = self.windows.last_mut() {
+                    if w.maximized {
+                        if let Some(sb) = w.saved_bounds {
+                            w.x = sb.x;
+                            w.y = sb.y;
+                            w.w = sb.w;
+                            w.h = sb.h;
+                        }
+                        w.maximized = false;
+                    } else {
+                        w.saved_bounds = Some(w.frame_rect());
+                        w.x = 0;
+                        w.y = 0;
+                        w.w = FB_WIDTH as i32;
+                        w.h = FB_HEIGHT as i32 - TASKBAR_H;
+                        w.maximized = true;
+                    }
+                }
+                return;
+            }
+
             self.focus_window(id);
 
-            if titlebar_clicked {
+            if resize_hit {
+                self.resizing_win_id = Some(id);
+                return;
+            }
+
+            if title_hit {
                 self.dragging_win_id = Some(id);
                 self.drag_offset_x = x - win_origin.0;
                 self.drag_offset_y = y - win_origin.1;
@@ -383,14 +515,23 @@ impl Kernel {
                     _ => {}
                 }
             }
+            return;
+        }
+
+        // 5. Desktop shortcut icons
+        for (idx, (_, exe_path, _)) in self.desktop_shortcuts().iter().enumerate() {
+            let icon_rect = Rect::new(18, 22 + (idx as i32) * 78, 76, 66);
+            if icon_rect.contains(x, y) {
+                let _ = self.exec_wbo(exe_path, None);
+                return;
+            }
         }
     }
 
     fn handle_files_click(&mut self, x: i32, y: i32, client: Rect) {
-        // Toolbar buttons: [+File] [+Dir] [Up]
-        let new_file_btn = Rect::new(client.x + client.w - 178, client.y + 5, 56, 20);
-        let new_dir_btn = Rect::new(client.x + client.w - 116, client.y + 5, 52, 20);
-        let up_btn = Rect::new(client.x + client.w - 58, client.y + 5, 50, 20);
+        let new_file_btn = Rect::new(client.x + client.w - 184, client.y + 6, 58, 22);
+        let new_dir_btn = Rect::new(client.x + client.w - 120, client.y + 6, 54, 22);
+        let up_btn = Rect::new(client.x + client.w - 60, client.y + 6, 50, 22);
 
         if new_file_btn.contains(x, y) {
             let mut idx = 1;
@@ -401,7 +542,7 @@ impl Kernel {
                     format!("{}/new_app_{}.wbml", self.explorer_dir, idx)
                 };
                 if !self.fs.exists(&candidate) {
-                    let starter = "app \"NewApp\" 320 190\nvar n = 0\nlabel lbl 20 20 \"Value: {n}\"\nbutton add 20 60 100 32 \"Add 1\" {\n    n = n + 1\n}\n";
+                    let starter = "app \"NewApp\" 320 210 {\n    state {\n        n = 0\n    }\n    col pad=16 gap=12 {\n        text \"Value: {n}\" size=lg color=#58F284\n        btn \"Add 1\" style=primary { n = n + 1 }\n    }\n}\n";
                     let _ = self.fs.write_str(&candidate, starter);
                     self.selected_path = Some(candidate.clone());
                     self.open_in_editor(&candidate);
@@ -435,10 +576,9 @@ impl Kernel {
             return;
         }
 
-        // Preview panel action buttons: [Edit] [Run] [Del]
-        let preview_y = client.y + client.h - 106;
-        let del_btn = Rect::new(client.x + client.w - 62, preview_y + 6, 46, 20);
-        let action_btn = Rect::new(client.x + client.w - 120, preview_y + 6, 52, 20);
+        let preview_y = client.y + client.h - 110;
+        let del_btn = Rect::new(client.x + client.w - 64, preview_y + 8, 48, 22);
+        let action_btn = Rect::new(client.x + client.w - 124, preview_y + 8, 54, 22);
 
         if let Some(sel) = self.selected_path.clone() {
             if del_btn.contains(x, y) {
@@ -462,10 +602,9 @@ impl Kernel {
             }
         }
 
-        // Directory / file rows
-        let rel_y = y - (client.y + 32);
+        let rel_y = y - (client.y + 36);
         if rel_y >= 0 && y < preview_y - 4 {
-            let row_idx = (rel_y / 22) as usize;
+            let row_idx = (rel_y / 24) as usize;
             if let Ok(entries) = self.fs.list_dir(&self.explorer_dir) {
                 if let Some((name, is_dir, _)) = entries.get(row_idx) {
                     let full_path = if self.explorer_dir == "C:/" {
@@ -486,9 +625,17 @@ impl Kernel {
     }
 
     fn handle_editor_click(&mut self, x: i32, y: i32, client: Rect) {
-        let save_btn = Rect::new(client.x + client.w - 246, client.y + 5, 62, 22);
-        let build_btn = Rect::new(client.x + client.w - 178, client.y + 5, 108, 22);
-        let run_btn = Rect::new(client.x + client.w - 64, client.y + 5, 54, 22);
+        let guides_btn = Rect::new(client.x + client.w - 328, client.y + 5, 74, 22);
+        let save_btn = Rect::new(client.x + client.w - 248, client.y + 5, 62, 22);
+        let build_btn = Rect::new(client.x + client.w - 180, client.y + 5, 108, 22);
+        let run_btn = Rect::new(client.x + client.w - 66, client.y + 5, 56, 22);
+
+        if guides_btn.contains(x, y) {
+            if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
+                ed.show_guides = !ed.show_guides;
+            }
+            return;
+        }
 
         if save_btn.contains(x, y) {
             self.save_active_editor();
@@ -496,52 +643,98 @@ impl Kernel {
         }
 
         if build_btn.contains(x, y) {
-            self.save_active_editor();
-            let src_path = self
-                .windows
-                .last()
-                .and_then(|w| w.editor.as_ref())
-                .map(|ed| ed.file_path.clone());
+            self.build_and_run_active_editor(false);
+            return;
+        }
 
-            if let Some(path) = src_path {
-                let result = self.compile_wbml_path(&path, None);
-                if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
-                    match result {
-                        Ok(out_wbo) => {
-                            ed.status = format!("Compiled -> {}", out_wbo);
-                            ed.built_wbo_path = Some(out_wbo);
-                        }
-                        Err(err) => {
-                            ed.status = format!("Compile Error: {}", err);
-                        }
-                    }
+        if run_btn.contains(x, y) {
+            self.build_and_run_active_editor(true);
+            return;
+        }
+
+        let has_preview = self
+            .windows
+            .last()
+            .and_then(|w| w.editor.as_ref())
+            .map(|ed| ed.file_path.ends_with(".wbml"))
+            .unwrap_or(false);
+
+        let split_x = if has_preview {
+            client.x + (client.w * 56) / 100
+        } else {
+            client.x + client.w
+        };
+
+        // Interactive click inside Live Preview Pane!
+        if has_preview && x >= split_x {
+            let preview_area = Rect::new(
+                split_x + 12,
+                client.y + 62,
+                client.x + client.w - split_x - 24,
+                client.h - 94,
+            );
+            if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
+                if let Some(rt) = ed.live_runtime.as_mut() {
+                    let app_rect = Rect::new(
+                        preview_area.x + ((preview_area.w - ed.live_size.0) / 2).max(0),
+                        preview_area.y + ((preview_area.h - ed.live_size.1) / 2).max(0),
+                        ed.live_size.0.min(preview_area.w),
+                        ed.live_size.1.min(preview_area.h),
+                    );
+                    Self::dispatch_runtime_click(rt, app_rect, x, y, ed.show_guides);
                 }
             }
             return;
         }
 
-        if run_btn.contains(x, y) {
-            let target_wbo = self
-                .windows
-                .last()
-                .and_then(|w| w.editor.as_ref())
-                .and_then(|ed| ed.built_wbo_path.clone());
-            if let Some(wbo_path) = target_wbo {
-                let _ = self.exec_wbo(&wbo_path, None);
-            }
-            return;
-        }
-
-        // Click inside text area to move cursor
-        let text_top = client.y + 36;
-        let text_left = client.x + 54;
-        if y >= text_top && x >= text_left {
+        // Click inside code area to position cursor
+        let text_top = client.y + 38;
+        let text_left = client.x + 52;
+        if y >= text_top && x >= text_left && x < split_x {
             if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
                 let clicked_row = ((y - text_top) / (CHAR_H as i32)) as usize;
                 let clicked_col = ((x - text_left) / (CHAR_W as i32)) as usize;
                 let target_line = (ed.scroll_y + clicked_row).min(ed.lines.len().saturating_sub(1));
                 ed.cursor_line = target_line;
-                ed.cursor_col = clicked_col.min(ed.lines[target_line].len());
+                ed.cursor_col = clicked_col.min(char_len(&ed.lines[target_line]));
+            }
+        }
+    }
+
+    fn dispatch_runtime_click(
+        rt: &mut DeclarativeRuntime,
+        bounds: Rect,
+        x: i32,
+        y: i32,
+        show_guides: bool,
+    ) {
+        let rendered = rt.layout(bounds, show_guides);
+        rt.focused_input = None;
+        for w in rendered.iter().rev() {
+            if !w.rect.contains(x, y) {
+                continue;
+            }
+            match &w.kind {
+                RenderedWidgetKind::Button { script, .. } => {
+                    let s = script.clone();
+                    rt.run_script(&s);
+                    break;
+                }
+                RenderedWidgetKind::Input { bind, .. } => {
+                    rt.focused_input = Some(bind.clone());
+                    break;
+                }
+                RenderedWidgetKind::Toggle { bind, checked, .. } => {
+                    rt.vars.insert(bind.clone(), Value::Bool(!checked));
+                    break;
+                }
+                RenderedWidgetKind::Slider { bind, min, max, .. } => {
+                    let ratio = ((x - w.rect.x).clamp(0, w.rect.w) as i64) * (*max - *min);
+                    let new_val = *min + ratio / (w.rect.w.max(1) as i64);
+                    rt.vars.insert(bind.clone(), Value::Int(new_val));
+                    break;
+                }
+                _ => {}
             }
         }
     }
@@ -549,23 +742,40 @@ impl Kernel {
     fn handle_declarative_click(&mut self, x: i32, y: i32, client: Rect) {
         if let Some(win) = self.windows.last_mut() {
             if let Some(rt) = win.runtime.as_mut() {
-                let rel_x = x - client.x;
-                let rel_y = y - client.y;
-                let mut script_to_run = None;
+                Self::dispatch_runtime_click(rt, client, x, y, false);
+            }
+        }
+    }
 
-                for w in &rt.widgets {
-                    if matches!(w.kind, UiWidgetKind::Button) {
-                        let btn_rect = Rect::new(w.x, w.y, w.w, w.h);
-                        if btn_rect.contains(rel_x, rel_y) {
-                            script_to_run = Some(w.script.clone());
-                            break;
-                        }
-                    }
+    fn flush_runtime_effects(&mut self) {
+        let mut effects = Vec::new();
+        for w in &mut self.windows {
+            if let Some(rt) = w.runtime.as_mut() {
+                effects.append(&mut rt.pending_effects);
+            }
+            if let Some(ed) = w.editor.as_mut() {
+                if let Some(rt) = ed.live_runtime.as_mut() {
+                    effects.append(&mut rt.pending_effects);
                 }
+            }
+        }
 
-                if let Some(script) = script_to_run {
-                    rt.run_script(&script);
+        for eff in effects {
+            match eff.kind.as_str() {
+                "open" => {
+                    let candidate = if eff.arg1.contains('/') {
+                        eff.arg1
+                    } else if eff.arg1.ends_with(".wbo") {
+                        format!("C:/WebOS/bin/Apps/{}", eff.arg1)
+                    } else {
+                        format!("C:/WebOS/bin/Apps/{}.wbo", eff.arg1)
+                    };
+                    let _ = self.exec_wbo(&candidate, None);
                 }
+                "fs_write" => {
+                    let _ = self.fs.write_str(&eff.arg1, &eff.arg2);
+                }
+                _ => {}
             }
         }
     }
@@ -573,17 +783,16 @@ impl Kernel {
     pub fn on_mouse_up(&mut self, _x: i32, _y: i32, button: u32) {
         if button == 0 {
             self.dragging_win_id = None;
+            self.resizing_win_id = None;
         }
     }
 
     pub fn on_key(&mut self, code: u32, hw: &dyn Hardware) {
-        // 1. Windows / Super / Meta / F1 key toggles the WebOS Launcher
         if code == 1005 {
             self.toggle_launcher();
             return;
         }
 
-        // 2. If Launcher Menu is open, route keys to Launcher search
         if self.launcher_open {
             match code {
                 27 => self.launcher_open = false,
@@ -610,39 +819,114 @@ impl Kernel {
             return;
         }
 
-        // 3. Route keys to the focused top-most window
-        let focused_subsys = self.windows.last().map(|w| w.subsystem);
+        let focused_subsys = self
+            .windows
+            .last()
+            .filter(|w| !w.minimized)
+            .map(|w| w.subsystem);
+
         match focused_subsys {
             Some(WboSubsystem::Editor) => self.on_editor_key(code),
             Some(WboSubsystem::Terminal) => self.on_terminal_key(code, hw),
+            Some(WboSubsystem::DeclarativeApp) => self.on_declarative_key(code),
             _ => {}
+        }
+    }
+
+    fn key_code_to_name(code: u32) -> Option<String> {
+        match code {
+            8 => Some("Backspace".into()),
+            9 => Some("Tab".into()),
+            13 => Some("Enter".into()),
+            27 => Some("Escape".into()),
+            1001 => Some("ArrowUp".into()),
+            1002 => Some("ArrowDown".into()),
+            1003 => Some("ArrowLeft".into()),
+            1004 => Some("ArrowRight".into()),
+            32..=126 => char::from_u32(code).map(|c| c.to_string()),
+            _ => None,
+        }
+    }
+
+    fn on_declarative_key(&mut self, code: u32) {
+        if let Some(kname) = Self::key_code_to_name(code) {
+            if let Some(win) = self.windows.last_mut() {
+                if let Some(rt) = win.runtime.as_mut() {
+                    rt.on_key_event(&kname);
+                }
+            }
         }
     }
 
     fn on_editor_key(&mut self, code: u32) {
         if code == 2001 {
-            // Ctrl+S
             self.save_active_editor();
             return;
         }
+        if code == 2002 {
+            self.build_and_run_active_editor(true);
+            return;
+        }
+
+        // If user focused an input field inside the Live Preview pane, forward typing there
+        let preview_input_focused = self
+            .windows
+            .last()
+            .and_then(|w| w.editor.as_ref())
+            .and_then(|ed| ed.live_runtime.as_ref())
+            .map(|rt| rt.focused_input.is_some())
+            .unwrap_or(false);
+
+        if preview_input_focused {
+            if let Some(kname) = Self::key_code_to_name(code) {
+                if let Some(rt) = self
+                    .windows
+                    .last_mut()
+                    .and_then(|w| w.editor.as_mut())
+                    .and_then(|ed| ed.live_runtime.as_mut())
+                {
+                    rt.on_key_event(&kname);
+                }
+            }
+            return;
+        }
+
+        let visible_rows = self
+            .windows
+            .last()
+            .map(|w| ((w.h - TITLEBAR_H - 68).max(40) as usize) / CHAR_H)
+            .unwrap_or(18);
 
         let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) else {
             return;
         };
 
+        let mut modified = false;
+
         match code {
+            // Wheel Up / Down
+            1010 => {
+                ed.scroll_y = ed.scroll_y.saturating_sub(2);
+                return;
+            }
+            1011 => {
+                if ed.scroll_y + 2 < ed.lines.len() {
+                    ed.scroll_y += 2;
+                }
+                return;
+            }
             // ArrowUp
             1001 => {
                 if ed.cursor_line > 0 {
                     ed.cursor_line -= 1;
-                    ed.cursor_col = ed.cursor_col.min(ed.lines[ed.cursor_line].len());
+                    ed.cursor_col = ed.cursor_col.min(char_len(&ed.lines[ed.cursor_line]));
                 }
             }
             // ArrowDown
             1002 => {
                 if ed.cursor_line + 1 < ed.lines.len() {
                     ed.cursor_line += 1;
-                    ed.cursor_col = ed.cursor_col.min(ed.lines[ed.cursor_line].len());
+                    ed.cursor_col = ed.cursor_col.min(char_len(&ed.lines[ed.cursor_line]));
                 }
             }
             // ArrowLeft
@@ -651,57 +935,83 @@ impl Kernel {
                     ed.cursor_col -= 1;
                 } else if ed.cursor_line > 0 {
                     ed.cursor_line -= 1;
-                    ed.cursor_col = ed.lines[ed.cursor_line].len();
+                    ed.cursor_col = char_len(&ed.lines[ed.cursor_line]);
                 }
             }
             // ArrowRight
             1004 => {
-                if ed.cursor_col < ed.lines[ed.cursor_line].len() {
+                if ed.cursor_col < char_len(&ed.lines[ed.cursor_line]) {
                     ed.cursor_col += 1;
                 } else if ed.cursor_line + 1 < ed.lines.len() {
                     ed.cursor_line += 1;
                     ed.cursor_col = 0;
                 }
             }
+            1008 => ed.cursor_col = 0,
+            1009 => ed.cursor_col = char_len(&ed.lines[ed.cursor_line]),
             // Enter
             13 => {
-                let tail = ed.lines[ed.cursor_line].split_off(ed.cursor_col);
+                let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
+                let tail = ed.lines[ed.cursor_line].split_off(b_idx);
                 ed.cursor_line += 1;
                 ed.lines.insert(ed.cursor_line, tail);
                 ed.cursor_col = 0;
+                modified = true;
             }
             // Backspace
             8 => {
                 if ed.cursor_col > 0 {
                     ed.cursor_col -= 1;
-                    ed.lines[ed.cursor_line].remove(ed.cursor_col);
+                    let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
+                    ed.lines[ed.cursor_line].remove(b_idx);
+                    modified = true;
                 } else if ed.cursor_line > 0 {
                     let current = ed.lines.remove(ed.cursor_line);
                     ed.cursor_line -= 1;
-                    ed.cursor_col = ed.lines[ed.cursor_line].len();
+                    ed.cursor_col = char_len(&ed.lines[ed.cursor_line]);
                     ed.lines[ed.cursor_line].push_str(&current);
+                    modified = true;
+                }
+            }
+            // Delete
+            127 => {
+                if ed.cursor_col < char_len(&ed.lines[ed.cursor_line]) {
+                    let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
+                    ed.lines[ed.cursor_line].remove(b_idx);
+                    modified = true;
+                } else if ed.cursor_line + 1 < ed.lines.len() {
+                    let next = ed.lines.remove(ed.cursor_line + 1);
+                    ed.lines[ed.cursor_line].push_str(&next);
+                    modified = true;
                 }
             }
             // Tab -> 4 spaces
             9 => {
-                ed.lines[ed.cursor_line].insert_str(ed.cursor_col, "    ");
+                let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
+                ed.lines[ed.cursor_line].insert_str(b_idx, "    ");
                 ed.cursor_col += 4;
+                modified = true;
             }
             // Printable ASCII
             32..=126 => {
                 if let Some(ch) = char::from_u32(code) {
-                    ed.lines[ed.cursor_line].insert(ed.cursor_col, ch);
+                    let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
+                    ed.lines[ed.cursor_line].insert(b_idx, ch);
                     ed.cursor_col += 1;
+                    modified = true;
                 }
             }
             _ => {}
         }
 
-        // Keep cursor within visible scroll viewport
         if ed.cursor_line < ed.scroll_y {
             ed.scroll_y = ed.cursor_line;
-        } else if ed.cursor_line >= ed.scroll_y + EDITOR_VISIBLE_ROWS {
-            ed.scroll_y = ed.cursor_line + 1 - EDITOR_VISIBLE_ROWS;
+        } else if ed.cursor_line >= ed.scroll_y + visible_rows.max(1) {
+            ed.scroll_y = ed.cursor_line + 1 - visible_rows.max(1);
+        }
+
+        if modified {
+            Self::refresh_editor_live_preview(ed);
         }
     }
 
@@ -961,7 +1271,7 @@ impl Kernel {
             "@sys.theme" => match a1 {
                 "green" => {
                     self.term_fg = rgba(88, 242, 132);
-                    self.term_bg = rgba(13, 17, 23);
+                    self.term_bg = rgba(11, 15, 23);
                 }
                 "amber" => {
                     self.term_fg = rgba(255, 184, 77);
@@ -1027,18 +1337,220 @@ impl Kernel {
         }
     }
 
-    pub fn render(&mut self, hw: &dyn Hardware) {
-        let elapsed_ms = hw.uptime_ms().saturating_sub(self.boot_time_ms);
-        let blink_on = (hw.uptime_ms() / 500) % 2 == 0;
-        let top_win_id = self.windows.last().map(|w| w.id);
+    fn subsys_icon(sub: WboSubsystem) -> IconKind {
+        match sub {
+            WboSubsystem::Terminal => IconKind::Terminal,
+            WboSubsystem::Files => IconKind::Files,
+            WboSubsystem::SysMon => IconKind::SysMon,
+            WboSubsystem::Editor => IconKind::Editor,
+            WboSubsystem::DeclarativeApp => IconKind::AppBinary,
+        }
+    }
 
-        // Taskbar ONLY shows currently running windows
-        let mut taskbar_items: Vec<(usize, String, bool)> = self
+    fn syntax_color_for_line(line: &str) -> u32 {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.starts_with("//") {
+            rgba(110, 118, 129)
+        } else if t.starts_with("app ")
+            || t.starts_with("state")
+            || t.starts_with("on_tick")
+            || t.starts_with("on_key")
+            || t.starts_with("on_init")
+        {
+            rgba(210, 168, 255)
+        } else if t.starts_with("col")
+            || t.starts_with("row")
+            || t.starts_with("grid")
+            || t.starts_with("card")
+            || t.starts_with("canvas")
+        {
+            rgba(121, 192, 255)
+        } else if t.starts_with("btn ")
+            || t.starts_with("button ")
+            || t.starts_with("text ")
+            || t.starts_with("input")
+            || t.starts_with("slider")
+            || t.starts_with("toggle")
+            || t.starts_with("progress")
+        {
+            rgba(126, 231, 135)
+        } else if t.starts_with("if ") || t.starts_with("for ") || t.starts_with("else") {
+            rgba(255, 166, 87)
+        } else {
+            rgba(230, 237, 243)
+        }
+    }
+
+    fn render_declarative_widgets(
+        canvas: &mut Canvas,
+        widgets: &[RenderedWidget],
+        focused_input: Option<&str>,
+        mx: i32,
+        my: i32,
+        blink_on: bool,
+    ) {
+        for w in widgets {
+            let hovered = w.rect.contains(mx, my);
+            match &w.kind {
+                RenderedWidgetKind::GuideBox => {
+                    canvas.stroke_rect(w.rect, rgba(42, 62, 92));
+                }
+                RenderedWidgetKind::Card { bg, border, radius } => {
+                    canvas.fill_rounded_rect(w.rect, *radius, *bg);
+                    canvas.stroke_rounded_rect(w.rect, *radius, *border);
+                }
+                RenderedWidgetKind::Text { text, scale, align, color } => {
+                    let char_step = 5 * scale + scale.max(1);
+                    let text_w = (text.chars().count() as i32) * char_step;
+                    let tx = match align {
+                        TextAlign::Left => w.rect.x,
+                        TextAlign::Center => w.rect.x + ((w.rect.w - text_w) / 2).max(0),
+                        TextAlign::Right => w.rect.x + (w.rect.w - text_w).max(0),
+                    };
+                    let ty = w.rect.y + ((w.rect.h - 7 * scale) / 2).max(0);
+                    canvas.draw_text_scaled(tx, ty, text, *color, *scale);
+                }
+                RenderedWidgetKind::Button { text, style, .. } => {
+                    let (top_col, bot_col, border_col) = match style {
+                        ButtonStyle::Primary => (
+                            if hovered { rgba(56, 178, 78) } else { rgba(42, 152, 64) },
+                            rgba(30, 118, 48),
+                            rgba(88, 242, 132),
+                        ),
+                        ButtonStyle::Accent => (
+                            if hovered { rgba(48, 129, 247) } else { rgba(31, 111, 235) },
+                            rgba(22, 82, 180),
+                            rgba(121, 192, 255),
+                        ),
+                        ButtonStyle::Danger => (
+                            if hovered { rgba(235, 72, 68) } else { rgba(205, 52, 48) },
+                            rgba(155, 34, 32),
+                            rgba(255, 123, 114),
+                        ),
+                        ButtonStyle::Default => (
+                            if hovered { rgba(44, 58, 80) } else { rgba(33, 44, 61) },
+                            rgba(24, 32, 46),
+                            if hovered { rgba(121, 192, 255) } else { rgba(68, 84, 108) },
+                        ),
+                    };
+                    canvas.fill_gradient_v(w.rect, top_col, bot_col);
+                    canvas.stroke_rounded_rect(w.rect, 6, border_col);
+                    let text_w = (text.chars().count() * CHAR_W) as i32;
+                    let tx = w.rect.x + ((w.rect.w - text_w) / 2).max(6);
+                    let ty = w.rect.y + ((w.rect.h - 14) / 2).max(4);
+                    canvas.draw_text(tx, ty, text, rgba(255, 255, 255), top_col);
+                }
+                RenderedWidgetKind::Input { bind, text, placeholder } => {
+                    let is_active = focused_input == Some(bind.as_str());
+                    let bg = rgba(10, 14, 20);
+                    canvas.fill_rounded_rect(w.rect, 5, bg);
+                    canvas.stroke_rounded_rect(
+                        w.rect,
+                        5,
+                        if is_active { rgba(88, 242, 132) } else { rgba(48, 54, 61) },
+                    );
+                    let display = if text.is_empty() && !is_active {
+                        placeholder.as_str()
+                    } else {
+                        text.as_str()
+                    };
+                    let fg = if text.is_empty() && !is_active {
+                        rgba(110, 118, 129)
+                    } else {
+                        rgba(230, 237, 243)
+                    };
+                    canvas.draw_text(w.rect.x + 8, w.rect.y + 8, display, fg, bg);
+                    if is_active && blink_on {
+                        let cx = w.rect.x + 8 + (text.chars().count() * CHAR_W) as i32;
+                        canvas.fill_rect(Rect::new(cx, w.rect.y + 7, 2, 17), rgba(88, 242, 132));
+                    }
+                }
+                RenderedWidgetKind::Slider { min, max, current, .. } => {
+                    let track = Rect::new(w.rect.x + 4, w.rect.y + w.rect.h / 2 - 3, w.rect.w - 8, 6);
+                    canvas.fill_rounded_rect(track, 3, rgba(13, 17, 23));
+                    let span = (*max - *min).max(1);
+                    let fill_w = (((*current - *min).clamp(0, span) * (track.w as i64)) / span) as i32;
+                    canvas.fill_rounded_rect(
+                        Rect::new(track.x, track.y, fill_w.max(4), track.h),
+                        3,
+                        rgba(88, 166, 255),
+                    );
+                    canvas.fill_circle(track.x + fill_w, track.y + 3, 7, rgba(240, 246, 252));
+                }
+                RenderedWidgetKind::Toggle { label, checked, .. } => {
+                    let pill = Rect::new(w.rect.x, w.rect.y + 4, 38, 20);
+                    let pill_col = if *checked { rgba(46, 160, 67) } else { rgba(48, 54, 61) };
+                    canvas.fill_rounded_rect(pill, 10, pill_col);
+                    let knob_x = if *checked { pill.x + 28 } else { pill.x + 10 };
+                    canvas.fill_circle(knob_x, pill.y + 10, 7, rgba(255, 255, 255));
+                    canvas.draw_text(w.rect.x + 48, w.rect.y + 6, label, rgba(230, 237, 243), pill_col);
+                }
+                RenderedWidgetKind::Progress { ratio_pct, color } => {
+                    canvas.fill_rounded_rect(w.rect, 5, rgba(13, 17, 23));
+                    canvas.stroke_rounded_rect(w.rect, 5, rgba(48, 54, 61));
+                    let fw = ((w.rect.w - 4) * ratio_pct) / 100;
+                    if fw > 0 {
+                        canvas.fill_rounded_rect(
+                            Rect::new(w.rect.x + 2, w.rect.y + 2, fw, w.rect.h - 4),
+                            4,
+                            *color,
+                        );
+                    }
+                }
+                RenderedWidgetKind::CanvasBox { bg, cmds } => {
+                    canvas.fill_rounded_rect(w.rect, 6, *bg);
+                    canvas.stroke_rounded_rect(w.rect, 6, rgba(48, 54, 61));
+                    for &(op, a, b, c, d, col) in cmds {
+                        match op {
+                            0 => canvas.fill_rounded_rect(w.rect, 6, col),
+                            1 => canvas.fill_rect(Rect::new(w.rect.x + a, w.rect.y + b, c, d), col),
+                            2 => canvas.fill_circle(w.rect.x + a, w.rect.y + b, c, col),
+                            3 => canvas.draw_line(
+                                w.rect.x + a,
+                                w.rect.y + b,
+                                w.rect.x + c,
+                                w.rect.y + d,
+                                col,
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn render(&mut self, hw: &dyn Hardware) {
+        let now_ms = hw.uptime_ms();
+        let elapsed_ms = now_ms.saturating_sub(self.boot_time_ms);
+        let blink_on = (now_ms / 500) % 2 == 0;
+
+        // Advance timers for running DeclarativeApps and Editor Live Previews
+        for win in &mut self.windows {
+            if let Some(rt) = win.runtime.as_mut() {
+                rt.tick(now_ms);
+            }
+            if let Some(ed) = win.editor.as_mut() {
+                if let Some(rt) = ed.live_runtime.as_mut() {
+                    rt.tick(now_ms);
+                }
+            }
+        }
+        self.flush_runtime_effects();
+
+        let top_win_id = self
             .windows
             .iter()
-            .map(|w| (w.id, w.title.clone(), Some(w.id) == top_win_id))
+            .rev()
+            .find(|w| !w.minimized)
+            .map(|w| w.id);
+
+        let mut taskbar_items: Vec<(usize, String, WboSubsystem, bool)> = self
+            .windows
+            .iter()
+            .map(|w| (w.id, w.title.clone(), w.subsystem, Some(w.id) == top_win_id))
             .collect();
-        taskbar_items.sort_by_key(|(id, _, _)| *id);
+        taskbar_items.sort_by_key(|(id, _, _, _)| *id);
 
         let dir_entries = self.fs.list_dir(&self.explorer_dir).unwrap_or_default();
         let selected_preview: Option<(String, bool)> = self.selected_path.as_ref().map(|p| {
@@ -1061,56 +1573,95 @@ impl Kernel {
         };
         let launcher_rect = self.launcher_rect();
         let launcher_btn = self.launcher_btn_rect();
+        let shortcuts = self.desktop_shortcuts();
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
 
         let mut canvas = Canvas::new(&mut self.framebuffer);
 
-        // 1. Desktop Wallpaper
+        // 1. Desktop Wallpaper & Shortcut Icons
         canvas.draw_wallpaper();
+        for (idx, (label, _, icon)) in shortcuts.iter().enumerate() {
+            let srect = Rect::new(18, 22 + (idx as i32) * 78, 76, 66);
+            if srect.contains(mx, my) {
+                canvas.fill_rect_alpha(srect, rgba(88, 166, 255), 35);
+                canvas.stroke_rounded_rect(srect, 8, rgba(88, 166, 255));
+            }
+            canvas.draw_icon(srect.x + 30, srect.y + 12, *icon);
+            let tw = (label.chars().count() as i32) * 6;
+            canvas.draw_text_scaled(
+                srect.x + ((srect.w - tw) / 2).max(2),
+                srect.y + 38,
+                label,
+                rgba(220, 228, 238),
+                1,
+            );
+        }
 
-        // 2. Render running windows
-        for win in &self.windows {
+        // 2. Render Visible Running Windows
+        for win in &mut self.windows {
+            if win.minimized {
+                continue;
+            }
             let is_focused = Some(win.id) == top_win_id;
             let frame = win.frame_rect();
             let titlebar = win.titlebar_rect();
             let close_btn = win.close_btn_rect();
+            let max_btn = win.max_btn_rect();
+            let min_btn = win.min_btn_rect();
             let client = win.client_rect();
 
             let border_col = if is_focused {
                 rgba(88, 166, 255)
             } else {
-                rgba(48, 54, 61)
+                rgba(48, 58, 74)
             };
-            let title_bg = if is_focused {
-                rgba(28, 37, 52)
+            let title_top = if is_focused {
+                rgba(33, 46, 68)
             } else {
-                rgba(22, 27, 34)
+                rgba(22, 29, 41)
+            };
+            let title_bot = if is_focused {
+                rgba(22, 31, 46)
+            } else {
+                rgba(17, 22, 31)
             };
 
             canvas.reset_clip();
-            canvas.fill_rect(
-                Rect::new(frame.x + 5, frame.y + 5, frame.w, frame.h),
-                rgba(7, 10, 14),
-            );
-            canvas.fill_rect(frame, rgba(16, 21, 29));
-            canvas.stroke_rect(frame, border_col);
+            if !win.maximized {
+                canvas.draw_shadow(frame, 8);
+            }
+            canvas.fill_rounded_rect(frame, if win.maximized { 0 } else { 8 }, rgba(15, 20, 29));
+            canvas.stroke_rounded_rect(frame, if win.maximized { 0 } else { 8 }, border_col);
 
             canvas.set_clip(titlebar);
-            canvas.fill_rect(titlebar, title_bg);
+            canvas.fill_gradient_v(titlebar, title_top, title_bot);
+            canvas.fill_rect(
+                Rect::new(titlebar.x, titlebar.y + titlebar.h - 1, titlebar.w, 1),
+                rgba(42, 54, 72),
+            );
+            canvas.draw_icon(titlebar.x + 10, titlebar.y + 8, Self::subsys_icon(win.subsystem));
             canvas.draw_text(
-                titlebar.x + 10,
-                titlebar.y + 7,
+                titlebar.x + 32,
+                titlebar.y + 8,
                 &win.title,
-                rgba(230, 237, 243),
-                title_bg,
+                rgba(235, 241, 248),
+                title_top,
             );
-            canvas.fill_rect(close_btn, rgba(218, 54, 51));
-            canvas.draw_text(
-                close_btn.x + 5,
-                close_btn.y + 3,
-                "X",
-                rgba(255, 255, 255),
-                rgba(218, 54, 51),
-            );
+
+            // Window control buttons (Min, Max, Close)
+            let min_col = if min_btn.contains(mx, my) { rgba(62, 76, 98) } else { rgba(38, 48, 64) };
+            canvas.fill_rounded_rect(min_btn, 4, min_col);
+            canvas.fill_rect(Rect::new(min_btn.x + 5, min_btn.y + 13, 10, 2), rgba(230, 237, 243));
+
+            let max_col = if max_btn.contains(mx, my) { rgba(62, 76, 98) } else { rgba(38, 48, 64) };
+            canvas.fill_rounded_rect(max_btn, 4, max_col);
+            canvas.stroke_rect(Rect::new(max_btn.x + 5, max_btn.y + 5, 10, 10), rgba(230, 237, 243));
+
+            let close_col = if close_btn.contains(mx, my) { rgba(240, 72, 68) } else { rgba(205, 52, 48) };
+            canvas.fill_rounded_rect(close_btn, 4, close_col);
+            canvas.draw_line(close_btn.x + 6, close_btn.y + 6, close_btn.x + 13, close_btn.y + 13, rgba(255, 255, 255));
+            canvas.draw_line(close_btn.x + 13, close_btn.y + 6, close_btn.x + 6, close_btn.y + 13, rgba(255, 255, 255));
 
             canvas.set_clip(client);
             match win.subsystem {
@@ -1121,7 +1672,7 @@ impl Kernel {
                             let ch = self.term_grid[r * TERM_COLS + c];
                             if ch != ' ' {
                                 canvas.draw_char(
-                                    client.x + 8 + (c * CHAR_W) as i32,
+                                    client.x + 10 + (c * CHAR_W) as i32,
                                     client.y + 8 + (r * CHAR_H) as i32,
                                     ch,
                                     self.term_fg,
@@ -1133,7 +1684,7 @@ impl Kernel {
                     if is_focused && blink_on && self.cursor_x < TERM_COLS && self.cursor_y < TERM_ROWS {
                         canvas.fill_rect(
                             Rect::new(
-                                client.x + 8 + (self.cursor_x * CHAR_W) as i32,
+                                client.x + 10 + (self.cursor_x * CHAR_W) as i32,
                                 client.y + 8 + (self.cursor_y * CHAR_H) as i32,
                                 9,
                                 15,
@@ -1143,107 +1694,113 @@ impl Kernel {
                     }
                 }
                 WboSubsystem::Files => {
-                    let panel_bg = rgba(16, 21, 29);
+                    let panel_bg = rgba(15, 20, 29);
                     canvas.fill_rect(client, panel_bg);
 
-                    // Path header & [+File] [+Dir] [Up]
+                    canvas.draw_icon(client.x + 10, client.y + 9, IconKind::Folder);
                     canvas.draw_text(
-                        client.x + 10,
-                        client.y + 8,
+                        client.x + 32,
+                        client.y + 9,
                         &self.explorer_dir,
-                        rgba(86, 212, 255),
+                        rgba(121, 192, 255),
                         panel_bg,
                     );
 
-                    let new_file_btn = Rect::new(client.x + client.w - 178, client.y + 5, 56, 20);
-                    let new_dir_btn = Rect::new(client.x + client.w - 116, client.y + 5, 52, 20);
-                    let up_btn = Rect::new(client.x + client.w - 58, client.y + 5, 50, 20);
+                    let new_file_btn = Rect::new(client.x + client.w - 184, client.y + 6, 58, 22);
+                    let new_dir_btn = Rect::new(client.x + client.w - 120, client.y + 6, 54, 22);
+                    let up_btn = Rect::new(client.x + client.w - 60, client.y + 6, 50, 22);
 
                     for (btn, lbl) in [
                         (new_file_btn, "+File"),
                         (new_dir_btn, "+Dir"),
                         (up_btn, "Up"),
                     ] {
-                        canvas.fill_rect(btn, rgba(33, 44, 61));
-                        canvas.stroke_rect(btn, rgba(88, 166, 255));
-                        canvas.draw_text(
-                            btn.x + 4,
-                            btn.y + 3,
-                            lbl,
-                            rgba(230, 237, 243),
-                            rgba(33, 44, 61),
-                        );
+                        let bg = if btn.contains(mx, my) { rgba(44, 58, 80) } else { rgba(28, 38, 54) };
+                        canvas.fill_rounded_rect(btn, 4, bg);
+                        canvas.stroke_rounded_rect(btn, 4, rgba(88, 166, 255));
+                        canvas.draw_text(btn.x + 4, btn.y + 4, lbl, rgba(230, 237, 243), bg);
                     }
 
-                    // Directory entries
                     for (idx, (name, is_dir, size)) in dir_entries.iter().enumerate() {
-                        let row_y = client.y + 32 + (idx as i32) * 22;
+                        let row_y = client.y + 36 + (idx as i32) * 24;
                         let full = if self.explorer_dir == "C:/" {
                             format!("C:/{}", name)
                         } else {
                             format!("{}/{}", self.explorer_dir, name)
                         };
+                        let row_rect = Rect::new(client.x + 8, row_y - 2, client.w - 16, 22);
                         let is_selected = self.selected_path.as_deref() == Some(full.as_str());
                         let row_bg = if is_selected {
                             rgba(31, 61, 97)
+                        } else if row_rect.contains(mx, my) {
+                            rgba(24, 33, 47)
                         } else {
                             panel_bg
                         };
 
-                        canvas.fill_rect(
-                            Rect::new(client.x + 6, row_y - 2, client.w - 12, 20),
-                            row_bg,
-                        );
-                        let label = if *is_dir {
-                            format!("[DIR]  {}/", name)
+                        canvas.fill_rounded_rect(row_rect, 4, row_bg);
+                        let icon = if *is_dir {
+                            IconKind::Folder
+                        } else if name.ends_with(".wbo") {
+                            IconKind::AppBinary
+                        } else if name.ends_with(".wbml") {
+                            IconKind::Blueprint
+                        } else if name.ends_with(".wbsh") {
+                            IconKind::Script
                         } else {
-                            format!("       {:<18} {:>4} B", name, size)
+                            IconKind::FileDoc
+                        };
+                        canvas.draw_icon(row_rect.x + 6, row_y + 1, icon);
+
+                        let label = if *is_dir {
+                            format!("{}/", name)
+                        } else {
+                            format!("{:<20} {:>5} B", name, size)
                         };
                         let fg = if *is_dir {
-                            rgba(255, 184, 77)
+                            rgba(255, 194, 92)
                         } else if name.ends_with(".wbo") || name.ends_with(".wbsh") {
                             rgba(126, 231, 135)
                         } else if name.ends_with(".wbml") {
-                            rgba(86, 212, 255)
+                            rgba(121, 192, 255)
                         } else {
                             rgba(230, 237, 243)
                         };
-                        canvas.draw_text(client.x + 10, row_y + 1, &label, fg, row_bg);
+                        canvas.draw_text(row_rect.x + 28, row_y + 2, &label, fg, row_bg);
                     }
 
-                    // Preview panel with [Edit]/[Run] and [Del]
-                    let preview_y = client.y + client.h - 106;
-                    let preview_rect = Rect::new(client.x + 8, preview_y, client.w - 16, 98);
-                    canvas.fill_rect(preview_rect, rgba(11, 15, 21));
-                    canvas.stroke_rect(preview_rect, rgba(48, 54, 61));
+                    let preview_y = client.y + client.h - 110;
+                    let preview_rect = Rect::new(client.x + 8, preview_y, client.w - 16, 102);
+                    canvas.fill_rounded_rect(preview_rect, 6, rgba(11, 15, 21));
+                    canvas.stroke_rounded_rect(preview_rect, 6, rgba(48, 54, 61));
 
                     if let Some((body, is_exec)) = &selected_preview {
-                        let del_btn = Rect::new(client.x + client.w - 62, preview_y + 6, 46, 20);
-                        let action_btn = Rect::new(client.x + client.w - 120, preview_y + 6, 52, 20);
+                        let del_btn = Rect::new(client.x + client.w - 64, preview_y + 8, 48, 22);
+                        let action_btn = Rect::new(client.x + client.w - 124, preview_y + 8, 54, 22);
 
-                        canvas.fill_rect(action_btn, rgba(35, 134, 54));
+                        canvas.fill_rounded_rect(action_btn, 4, rgba(35, 134, 54));
                         canvas.draw_text(
                             action_btn.x + 6,
-                            action_btn.y + 3,
+                            action_btn.y + 4,
                             if *is_exec { "Run" } else { "Edit" },
                             rgba(255, 255, 255),
                             rgba(35, 134, 54),
                         );
 
-                        canvas.fill_rect(del_btn, rgba(155, 42, 42));
+                        canvas.fill_rounded_rect(del_btn, 4, rgba(165, 42, 42));
                         canvas.draw_text(
-                            del_btn.x + 6,
-                            del_btn.y + 3,
+                            del_btn.x + 8,
+                            del_btn.y + 4,
                             "Del",
                             rgba(255, 255, 255),
-                            rgba(155, 42, 42),
+                            rgba(165, 42, 42),
                         );
 
                         for (line_idx, line_txt) in body.lines().take(3).enumerate() {
-                            let clipped: String = line_txt.chars().take(24).collect();
+                            let clipped: String = line_txt.chars().take(28).collect();
                             canvas.draw_text(
-                                preview_rect.x + 8,
-                                preview_rect.y + 10 + (line_idx as i32) * 22,
+                                preview_rect.x + 10,
+                                preview_rect.y + 12 + (line_idx as i32) * 22,
                                 &clipped,
                                 rgba(201, 209, 217),
                                 rgba(11, 15, 21),
@@ -1256,226 +1813,245 @@ impl Kernel {
                     let bar_bg = rgba(22, 27, 34);
                     canvas.fill_rect(client, bg);
 
-                    // Editor top toolbar
                     canvas.fill_rect(Rect::new(client.x, client.y, client.w, 32), bar_bg);
-                    if let Some(ed) = &win.editor {
+                    if let Some(ed) = win.editor.as_mut() {
+                        canvas.draw_icon(client.x + 10, client.y + 8, IconKind::Blueprint);
                         canvas.draw_text(
-                            client.x + 10,
+                            client.x + 32,
                             client.y + 8,
                             &ed.file_path,
-                            rgba(86, 212, 255),
+                            rgba(121, 192, 255),
                             bar_bg,
                         );
 
-                        let save_btn = Rect::new(client.x + client.w - 246, client.y + 5, 62, 22);
-                        let build_btn = Rect::new(client.x + client.w - 178, client.y + 5, 108, 22);
-                        let run_btn = Rect::new(client.x + client.w - 64, client.y + 5, 54, 22);
+                        let guides_btn = Rect::new(client.x + client.w - 328, client.y + 5, 74, 22);
+                        let save_btn = Rect::new(client.x + client.w - 248, client.y + 5, 62, 22);
+                        let build_btn = Rect::new(client.x + client.w - 180, client.y + 5, 108, 22);
+                        let run_btn = Rect::new(client.x + client.w - 66, client.y + 5, 56, 22);
 
-                        canvas.fill_rect(save_btn, rgba(33, 44, 61));
-                        canvas.stroke_rect(save_btn, rgba(88, 166, 255));
-                        canvas.draw_text(
-                            save_btn.x + 8,
-                            save_btn.y + 4,
-                            "Save",
-                            rgba(230, 237, 243),
-                            rgba(33, 44, 61),
-                        );
+                        let g_bg = if ed.show_guides { rgba(38, 56, 82) } else { rgba(28, 34, 44) };
+                        canvas.fill_rounded_rect(guides_btn, 4, g_bg);
+                        canvas.draw_text(guides_btn.x + 6, guides_btn.y + 4, "Guides", rgba(121, 192, 255), g_bg);
 
-                        canvas.fill_rect(build_btn, rgba(35, 134, 54));
-                        canvas.draw_text(
-                            build_btn.x + 6,
-                            build_btn.y + 4,
-                            "Build .wbo",
-                            rgba(255, 255, 255),
-                            rgba(35, 134, 54),
-                        );
+                        canvas.fill_rounded_rect(save_btn, 4, rgba(33, 44, 61));
+                        canvas.stroke_rounded_rect(save_btn, 4, rgba(88, 166, 255));
+                        canvas.draw_text(save_btn.x + 10, save_btn.y + 4, "Save", rgba(230, 237, 243), rgba(33, 44, 61));
 
-                        let run_bg = if ed.built_wbo_path.is_some() {
-                            rgba(31, 111, 235)
+                        canvas.fill_rounded_rect(build_btn, 4, rgba(35, 134, 54));
+                        canvas.draw_text(build_btn.x + 6, build_btn.y + 4, "Build .wbo", rgba(255, 255, 255), rgba(35, 134, 54));
+
+                        canvas.fill_rounded_rect(run_btn, 4, rgba(31, 111, 235));
+                        canvas.draw_text(run_btn.x + 12, run_btn.y + 4, "Run", rgba(255, 255, 255), rgba(31, 111, 235));
+
+                        let has_preview = ed.file_path.ends_with(".wbml");
+                        let split_x = if has_preview {
+                            client.x + (client.w * 56) / 100
                         } else {
-                            rgba(33, 38, 45)
+                            client.x + client.w
                         };
-                        canvas.fill_rect(run_btn, run_bg);
-                        canvas.draw_text(
-                            run_btn.x + 10,
-                            run_btn.y + 4,
-                            "Run",
-                            rgba(255, 255, 255),
-                            run_bg,
-                        );
 
-                        // Gutter & source lines
-                        let gutter_w = 46;
+                        let visible_rows = ((client.h - 60).max(20) as usize) / CHAR_H;
+                        let visible_cols = ((split_x - (client.x + 56)).max(40) as usize) / CHAR_W;
+
+                        // Gutter & Syntax-Highlighted Source Lines
                         canvas.fill_rect(
-                            Rect::new(client.x, client.y + 32, gutter_w, client.h - 58),
+                            Rect::new(client.x, client.y + 32, 46, client.h - 56),
                             rgba(16, 21, 29),
                         );
 
-                        for row in 0..EDITOR_VISIBLE_ROWS {
+                        for row in 0..visible_rows {
                             let line_idx = ed.scroll_y + row;
                             if line_idx >= ed.lines.len() {
                                 break;
                             }
-                            let py = client.y + 36 + (row * CHAR_H) as i32;
+                            let py = client.y + 38 + (row * CHAR_H) as i32;
+                            if line_idx == ed.cursor_line {
+                                canvas.fill_rect(
+                                    Rect::new(client.x + 46, py - 2, split_x - (client.x + 46), CHAR_H as i32),
+                                    rgba(20, 27, 38),
+                                );
+                            }
                             let lnum = format!("{:>3}", line_idx + 1);
                             canvas.draw_text(
                                 client.x + 6,
                                 py,
                                 &lnum,
-                                rgba(110, 118, 129),
+                                if line_idx == ed.cursor_line { rgba(121, 192, 255) } else { rgba(110, 118, 129) },
                                 rgba(16, 21, 29),
                             );
 
+                            let col_fg = Self::syntax_color_for_line(&ed.lines[line_idx]);
                             let visible_slice: String =
-                                ed.lines[line_idx].chars().take(EDITOR_VISIBLE_COLS).collect();
-                            canvas.draw_text(
-                                client.x + 54,
-                                py,
-                                &visible_slice,
-                                rgba(230, 237, 243),
-                                bg,
-                            );
+                                ed.lines[line_idx].chars().take(visible_cols).collect();
+                            canvas.draw_text(client.x + 52, py, &visible_slice, col_fg, bg);
                         }
 
-                        // Blinking text cursor
                         if is_focused
                             && blink_on
                             && ed.cursor_line >= ed.scroll_y
-                            && ed.cursor_line < ed.scroll_y + EDITOR_VISIBLE_ROWS
+                            && ed.cursor_line < ed.scroll_y + visible_rows
                         {
                             let vis_row = ed.cursor_line - ed.scroll_y;
-                            let vis_col = ed.cursor_col.min(EDITOR_VISIBLE_COLS);
-                            let cx = client.x + 54 + (vis_col * CHAR_W) as i32;
-                            let cy = client.y + 36 + (vis_row * CHAR_H) as i32;
+                            let vis_col = ed.cursor_col.min(visible_cols);
+                            let cx = client.x + 52 + (vis_col * CHAR_W) as i32;
+                            let cy = client.y + 38 + (vis_row * CHAR_H) as i32;
                             canvas.fill_rect(Rect::new(cx, cy, 2, 16), rgba(88, 242, 132));
                         }
 
-                        // Status footer bar
+                        // Right Split-Pane: LIVE INTERACTIVE WBML PREVIEW
+                        if has_preview {
+                            let pane_w = client.x + client.w - split_x;
+                            let pane_rect = Rect::new(split_x, client.y + 32, pane_w, client.h - 56);
+                            canvas.fill_rect(pane_rect, rgba(10, 14, 20));
+                            canvas.fill_rect(Rect::new(split_x, client.y + 32, 1, client.h - 56), rgba(48, 54, 61));
+
+                            let header_label = format!(
+                                "LIVE PREVIEW: \"{}\" ({}x{})",
+                                ed.live_title, ed.live_size.0, ed.live_size.1
+                            );
+                            canvas.draw_text_scaled(
+                                split_x + 12,
+                                client.y + 42,
+                                &header_label,
+                                rgba(121, 192, 255),
+                                1,
+                            );
+
+                            let show_guides = ed.show_guides;
+                            if let Some(rt) = ed.live_runtime.as_mut() {
+                                let preview_area = Rect::new(
+                                    split_x + 12,
+                                    client.y + 62,
+                                    pane_w - 24,
+                                    client.h - 94,
+                                );
+                                let app_w = ed.live_size.0.min(preview_area.w);
+                                let app_h = ed.live_size.1.min(preview_area.h);
+                                let app_rect = Rect::new(
+                                    preview_area.x + ((preview_area.w - app_w) / 2).max(0),
+                                    preview_area.y + ((preview_area.h - app_h) / 2).max(0),
+                                    app_w,
+                                    app_h,
+                                );
+
+                                canvas.fill_rounded_rect(app_rect, 8, rgba(16, 21, 29));
+                                canvas.stroke_rounded_rect(app_rect, 8, rgba(88, 166, 255));
+
+                                let widgets = rt.layout(app_rect, show_guides);
+                                Self::render_declarative_widgets(
+                                    &mut canvas,
+                                    &widgets,
+                                    rt.focused_input.as_deref(),
+                                    mx,
+                                    my,
+                                    blink_on,
+                                );
+                            }
+                        }
+
+                        // Status Footer
                         let status_y = client.y + client.h - 24;
                         canvas.fill_rect(Rect::new(client.x, status_y, client.w, 24), bar_bg);
-                        canvas.draw_text(
-                            client.x + 10,
-                            status_y + 4,
-                            &ed.status,
-                            rgba(126, 231, 135),
-                            bar_bg,
-                        );
+                        let st_col = if ed.status.starts_with("Syntax") || ed.status.starts_with("Compile") {
+                            rgba(255, 123, 114)
+                        } else {
+                            rgba(126, 231, 135)
+                        };
+                        canvas.draw_text(client.x + 10, status_y + 4, &ed.status, st_col, bar_bg);
                     }
                 }
                 WboSubsystem::SysMon => {
-                    let panel_bg = rgba(16, 21, 29);
+                    let panel_bg = rgba(15, 20, 29);
                     canvas.fill_rect(client, panel_bg);
 
                     let (used, total) = heap_stats();
                     let pct = ((used as f64 / total as f64) * 100.0).min(100.0);
 
                     canvas.draw_text(
-                        client.x + 12,
-                        client.y + 12,
+                        client.x + 14,
+                        client.y + 14,
                         &format!("Kernel Heap: {} / {} KiB ({:.1}%)", used / 1024, total / 1024, pct),
                         rgba(230, 237, 243),
                         panel_bg,
                     );
 
-                    let bar_rect = Rect::new(client.x + 12, client.y + 38, client.w - 24, 22);
-                    canvas.fill_rect(bar_rect, rgba(11, 15, 21));
-                    canvas.stroke_rect(bar_rect, rgba(48, 54, 61));
+                    let bar_rect = Rect::new(client.x + 14, client.y + 42, client.w - 28, 22);
+                    canvas.fill_rounded_rect(bar_rect, 6, rgba(10, 14, 20));
+                    canvas.stroke_rounded_rect(bar_rect, 6, rgba(48, 54, 61));
                     let fill_w = (((bar_rect.w - 4) as f64) * (pct / 100.0)) as i32;
-                    canvas.fill_rect(
-                        Rect::new(bar_rect.x + 2, bar_rect.y + 2, fill_w.max(4), bar_rect.h - 4),
+                    canvas.fill_rounded_rect(
+                        Rect::new(bar_rect.x + 2, bar_rect.y + 2, fill_w.max(6), bar_rect.h - 4),
+                        4,
                         rgba(88, 242, 132),
                     );
 
                     canvas.draw_text(
-                        client.x + 12,
-                        client.y + 78,
+                        client.x + 14,
+                        client.y + 82,
                         &format!("Running Processes: {}", self.windows.len()),
                         rgba(139, 148, 158),
                         panel_bg,
                     );
                     canvas.draw_text(
-                        client.x + 12,
-                        client.y + 104,
-                        "Exe Format: WBO\\x01 (.wbml -> .wbo)",
-                        rgba(86, 212, 255),
+                        client.x + 14,
+                        client.y + 108,
+                        "Exe Format: WBO\\x02 (WBML v2 Layout + VM)",
+                        rgba(121, 192, 255),
                         panel_bg,
                     );
                 }
                 WboSubsystem::DeclarativeApp => {
-                    let panel_bg = rgba(16, 21, 29);
+                    let panel_bg = rgba(15, 20, 29);
                     canvas.fill_rect(client, panel_bg);
 
-                    if let Some(rt) = &win.runtime {
-                        for w in &rt.widgets {
-                            let wx = client.x + w.x;
-                            let wy = client.y + w.y;
-                            match w.kind {
-                                UiWidgetKind::Rect(col) => {
-                                    let r = Rect::new(wx, wy, w.w, w.h);
-                                    canvas.fill_rect(r, col);
-                                    canvas.stroke_rect(r, rgba(48, 54, 61));
-                                }
-                                UiWidgetKind::Label => {
-                                    let rendered = rt.interpolate(&w.text);
-                                    canvas.draw_text(
-                                        wx,
-                                        wy,
-                                        &rendered,
-                                        rgba(230, 237, 243),
-                                        panel_bg,
-                                    );
-                                }
-                                UiWidgetKind::Button => {
-                                    let r = Rect::new(wx, wy, w.w, w.h);
-                                    let btn_bg = rgba(33, 44, 61);
-                                    canvas.fill_rect(r, btn_bg);
-                                    canvas.stroke_rect(r, rgba(88, 166, 255));
-                                    let rendered = rt.interpolate(&w.text);
-                                    let text_w = (rendered.chars().count() * CHAR_W) as i32;
-                                    let tx = wx + ((w.w - text_w) / 2).max(6);
-                                    let ty = wy + ((w.h - 14) / 2).max(4);
-                                    canvas.draw_text(
-                                        tx,
-                                        ty,
-                                        &rendered,
-                                        rgba(255, 255, 255),
-                                        btn_bg,
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(rt) = win.runtime.as_mut() {
+                        let widgets = rt.layout(client, false);
+                        Self::render_declarative_widgets(
+                            &mut canvas,
+                            &widgets,
+                            rt.focused_input.as_deref(),
+                            mx,
+                            my,
+                            blink_on,
+                        );
                     }
                 }
+            }
+
+            // Bottom-right window resize grip indicator
+            if !win.maximized {
+                canvas.reset_clip();
+                let gx = win.x + win.w - 10;
+                let gy = win.y + win.h - 10;
+                canvas.draw_line(gx, gy + 6, gx + 6, gy, rgba(110, 118, 129));
+                canvas.draw_line(gx + 3, gy + 6, gx + 6, gy + 3, rgba(110, 118, 129));
             }
         }
 
         // 3. Bottom-Right Searchable WebOS Launcher Popup
         if self.launcher_open {
             canvas.reset_clip();
-            canvas.fill_rect(
-                Rect::new(launcher_rect.x - 4, launcher_rect.y - 4, launcher_rect.w + 8, launcher_rect.h + 8),
-                rgba(7, 10, 14),
-            );
-            let l_bg = rgba(22, 27, 34);
-            canvas.fill_rect(launcher_rect, l_bg);
-            canvas.stroke_rect(launcher_rect, rgba(88, 166, 255));
+            canvas.draw_shadow(launcher_rect, 10);
+            let l_bg = rgba(20, 26, 36);
+            canvas.fill_rounded_rect(launcher_rect, 10, l_bg);
+            canvas.stroke_rounded_rect(launcher_rect, 10, rgba(88, 166, 255));
 
+            canvas.draw_icon(launcher_rect.x + 14, launcher_rect.y + 12, IconKind::WebOsLogo);
             canvas.draw_text(
-                launcher_rect.x + 12,
-                launcher_rect.y + 10,
-                "WebOS App Launcher",
-                rgba(230, 237, 243),
+                launcher_rect.x + 38,
+                launcher_rect.y + 11,
+                "WebOS Applications",
+                rgba(235, 241, 248),
                 l_bg,
             );
 
-            // Search input box
-            let search_box = Rect::new(launcher_rect.x + 12, launcher_rect.y + 36, launcher_rect.w - 24, 28);
-            let s_bg = rgba(13, 17, 23);
-            canvas.fill_rect(search_box, s_bg);
-            canvas.stroke_rect(search_box, rgba(88, 242, 132));
+            let search_box = Rect::new(launcher_rect.x + 14, launcher_rect.y + 40, launcher_rect.w - 28, 30);
+            let s_bg = rgba(11, 15, 22);
+            canvas.fill_rounded_rect(search_box, 6, s_bg);
+            canvas.stroke_rounded_rect(search_box, 6, rgba(88, 242, 132));
 
             let prompt_txt = if self.launcher_query.is_empty() {
-                "Search Apps/..."
+                "Type to filter apps..."
             } else {
                 &self.launcher_query
             };
@@ -1484,80 +2060,97 @@ impl Kernel {
             } else {
                 rgba(230, 237, 243)
             };
-            canvas.draw_text(search_box.x + 8, search_box.y + 7, prompt_txt, prompt_col, s_bg);
+            canvas.draw_text(search_box.x + 10, search_box.y + 7, prompt_txt, prompt_col, s_bg);
 
-            // Matching .wbo apps list
             for (idx, (app_name, _)) in launcher_apps.iter().take(8).enumerate() {
-                let row_y = launcher_rect.y + 78 + (idx as i32) * 28;
-                let row_rect = Rect::new(launcher_rect.x + 12, row_y, launcher_rect.w - 24, 24);
-                let row_bg = if idx == 0 { rgba(31, 61, 97) } else { l_bg };
-                canvas.fill_rect(row_rect, row_bg);
+                let row_y = launcher_rect.y + 84 + (idx as i32) * 30;
+                let row_rect = Rect::new(launcher_rect.x + 14, row_y, launcher_rect.w - 28, 26);
+                let row_bg = if idx == 0 || row_rect.contains(mx, my) {
+                    rgba(31, 61, 97)
+                } else {
+                    l_bg
+                };
+                canvas.fill_rounded_rect(row_rect, 5, row_bg);
+                let icon = match app_name.as_str() {
+                    "Terminal" => IconKind::Terminal,
+                    "Files" => IconKind::Files,
+                    "Editor" => IconKind::Editor,
+                    "SysMon" => IconKind::SysMon,
+                    _ => IconKind::AppBinary,
+                };
+                canvas.draw_icon(row_rect.x + 8, row_rect.y + 5, icon);
                 canvas.draw_text(
-                    row_rect.x + 10,
-                    row_rect.y + 4,
-                    &format!("{}.wbo", app_name),
-                    rgba(126, 231, 135),
+                    row_rect.x + 32,
+                    row_rect.y + 5,
+                    app_name,
+                    rgba(230, 237, 243),
                     row_bg,
                 );
             }
         }
 
-        // 4. Bottom Taskbar (ONLY running apps on left; Clock + WebOS button on bottom-right)
+        // 4. Bottom Glass & Slate Taskbar
         canvas.reset_clip();
         let tb_y = FB_HEIGHT as i32 - TASKBAR_H;
-        let tb_bg = rgba(22, 27, 34);
+        let tb_bg = rgba(17, 22, 32);
         canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, TASKBAR_H), tb_bg);
-        canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, 1), rgba(48, 54, 61));
+        canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, 1), rgba(44, 56, 74));
 
-        let mut bx = 10;
-        for (_, title, is_focused) in taskbar_items {
-            if bx + 136 > launcher_btn.x - 130 {
+        let mut bx = 12;
+        for (_, title, subsys, is_focused) in taskbar_items {
+            if bx + 148 > launcher_btn.x - 140 {
                 break;
             }
+            let btn_rect = Rect::new(bx, tb_y + 6, 142, TASKBAR_H - 12);
             let btn_bg = if is_focused {
-                rgba(33, 44, 61)
+                rgba(33, 47, 68)
+            } else if btn_rect.contains(mx, my) {
+                rgba(26, 36, 52)
             } else {
-                rgba(16, 21, 29)
+                rgba(21, 28, 40)
             };
-            let btn_rect = Rect::new(bx, tb_y + 5, 132, TASKBAR_H - 10);
-            canvas.fill_rect(btn_rect, btn_bg);
-            canvas.stroke_rect(
+            canvas.fill_rounded_rect(btn_rect, 6, btn_bg);
+            canvas.stroke_rounded_rect(
                 btn_rect,
-                if is_focused {
-                    rgba(88, 166, 255)
-                } else {
-                    rgba(48, 54, 61)
-                },
+                6,
+                if is_focused { rgba(88, 166, 255) } else { rgba(42, 52, 68) },
             );
-            let short_title: String = title.chars().take(9).collect();
-            canvas.draw_text(bx + 10, tb_y + 11, &short_title, rgba(230, 237, 243), btn_bg);
-            bx += 138;
+            canvas.draw_icon(bx + 8, tb_y + 13, Self::subsys_icon(subsys));
+            let short_title: String = title.chars().take(8).collect();
+            canvas.draw_text(bx + 30, tb_y + 13, &short_title, rgba(235, 241, 248), btn_bg);
+            if is_focused {
+                canvas.fill_rect(
+                    Rect::new(bx + 44, tb_y + TASKBAR_H - 4, 54, 2),
+                    rgba(88, 166, 255),
+                );
+            }
+            bx += 148;
         }
 
-        // Clock to the left of the bottom-right WebOS Launcher button
         let total_secs = elapsed_ms / 1000;
         let clock_str = format!("UP {:02}:{:02}", total_secs / 60, total_secs % 60);
         canvas.draw_text(
-            launcher_btn.x - 114,
-            tb_y + 11,
+            launcher_btn.x - 118,
+            tb_y + 13,
             &clock_str,
-            rgba(139, 148, 158),
+            rgba(150, 162, 178),
             tb_bg,
         );
 
-        // Bottom-right WebOS Start/Launcher Button
-        let wb_bg = if self.launcher_open {
-            rgba(46, 160, 67)
+        let wb_top = if self.launcher_open || launcher_btn.contains(mx, my) {
+            rgba(52, 174, 74)
         } else {
-            rgba(35, 134, 54)
+            rgba(38, 142, 58)
         };
-        canvas.fill_rect(launcher_btn, wb_bg);
+        canvas.fill_gradient_v(launcher_btn, wb_top, rgba(26, 108, 44));
+        canvas.stroke_rounded_rect(launcher_btn, 7, rgba(126, 231, 135));
+        canvas.draw_icon(launcher_btn.x + 10, launcher_btn.y + 7, IconKind::WebOsLogo);
         canvas.draw_text(
-            launcher_btn.x + 26,
-            launcher_btn.y + 6,
+            launcher_btn.x + 34,
+            launcher_btn.y + 7,
             "WebOS",
             rgba(255, 255, 255),
-            wb_bg,
+            wb_top,
         );
 
         // 5. Mouse Cursor

@@ -4,10 +4,11 @@
   <meta charset="UTF-8" />
   <title>WebOS — Rust #![no_std] Desktop in WebAssembly</title>
   <style>
+    * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background: #07090d;
+      background: radial-gradient(circle at 50% 20%, #111827 0%, #05070b 100%);
       color: #c9d1d9;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       display: flex;
@@ -18,23 +19,34 @@
       user-select: none;
     }
     canvas {
-      border: 2px solid #21262d;
-      border-radius: 8px;
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.75);
+      border: 1px solid #263042;
+      border-radius: 12px;
+      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(88, 166, 255, 0.08);
       width: 1280px;
-      max-width: 95vw;
+      max-width: 96vw;
       height: auto;
       cursor: none;
     }
     .hint {
-      font-size: 13px;
+      font-size: 12px;
       color: #8b949e;
+      letter-spacing: 0.3px;
+    }
+    code {
+      background: #161b22;
+      border: 1px solid #30363d;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #79c0ff;
     }
   </style>
 </head>
 <body>
   <canvas id="display"></canvas>
-  <div class="hint">Click <code>WebOS</code> (bottom-right) or press <code>Win / Super / F1</code> to search &amp; launch apps</div>
+  <div class="hint">
+    Click <code>WebOS</code> (bottom-right) or press <code>Win / Super / F1</code> to launch apps &bull;
+    Open <code>.wbml</code> in <code>Editor</code> for live split-pane UI preview
+  </div>
 
   <script>
     async function boot() {
@@ -52,7 +64,7 @@
       };
 
       const { instance } = await WebAssembly.instantiateStreaming(
-        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=4"),
+        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=5"),
         importObject
       );
 
@@ -91,18 +103,28 @@
         wasm.kernel_mouse_up(x, y, e.button);
       });
 
+      canvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? 1011 : 1010;
+        wasm.kernel_key_input(delta);
+      }, { passive: false });
+
       window.addEventListener("keydown", (e) => {
-        // Windows / Super / Meta key or F1 toggles the WebOS Launcher
         if (e.key === "Meta" || e.key === "OS" || e.key === "F1") {
           e.preventDefault();
           wasm.kernel_key_input(1005);
           return;
         }
 
-        // Ctrl+S saves the active file in Code Editor
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
           e.preventDefault();
           wasm.kernel_key_input(2001);
+          return;
+        }
+
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "r") {
+          e.preventDefault();
+          wasm.kernel_key_input(2002);
           return;
         }
 
@@ -113,10 +135,15 @@
           Tab: 9,
           Enter: 13,
           Escape: 27,
+          Delete: 127,
           ArrowUp: 1001,
           ArrowDown: 1002,
           ArrowLeft: 1003,
           ArrowRight: 1004,
+          PageUp: 1006,
+          PageDown: 1007,
+          Home: 1008,
+          End: 1009,
         };
 
         if (specialKeys[e.key] !== undefined) {
@@ -124,7 +151,10 @@
           wasm.kernel_key_input(specialKeys[e.key]);
         } else if (e.key.length === 1) {
           e.preventDefault();
-          wasm.kernel_key_input(e.key.charCodeAt(0));
+          const code = e.key.charCodeAt(0);
+          if (code >= 32 && code <= 126) {
+            wasm.kernel_key_input(code);
+          }
         }
       });
 

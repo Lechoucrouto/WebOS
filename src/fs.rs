@@ -20,7 +20,6 @@ impl FileSystem {
             cwd: String::from("C:/usr"),
         };
 
-        // Core directory hierarchy
         fs.nodes.insert(String::from("C:/"), FsNode::Dir);
         let _ = fs.mkdir("C:/usr");
         let _ = fs.mkdir("C:/WebOS");
@@ -28,19 +27,152 @@ impl FileSystem {
         let _ = fs.mkdir("C:/WebOS/bin/PATH");
         let _ = fs.mkdir("C:/WebOS/bin/Apps");
 
-        // User files & sample .wbml app source code in C:/usr/
         let _ = fs.write_str(
             "C:/usr/readme.txt",
-            "Welcome to WebOS v0.4.0!\n- Click Files or Editor in the bottom-right WebOS menu.\n- Open counter.wbml in Editor and click 'Build .wbo' to compile your own app!",
+            "Welcome to WebOS v0.5.0!\n- Open any .wbml file in Code Editor for a LIVE side-by-side preview.\n- Try counter.wbml, calculator.wbml, or snake.wbml in C:/usr/!",
         );
+
         let _ = fs.write_str(
             "C:/usr/counter.wbml",
-            "app \"Counter\" 340 205\nvar count = 0\nvar step = 1\n\nrect 16 14 304 54 dark\nlabel title 28 24 \"Count: {count}\"\nlabel sub 28 46 \"Step size: {step}\"\n\nbutton inc 16 82 94 34 \"+Step\" {\n    count = count + step\n}\nbutton dec 120 82 94 34 \"-Step\" {\n    count = count - step\n}\nbutton rst 224 82 94 34 \"Reset\" {\n    count = 0\n}\nbutton dbl 16 126 302 30 \"Double Step\" {\n    step = step * 2\n}\n",
+            r#"app "Counter" 340 245 {
+    state {
+        count = 0
+        step = 1
+    }
+
+    col pad=16 gap=12 {
+        card bg=#0D1117 border=#30363D pad=12 radius=6 {
+            text "Count: {count}" size=lg color=#58F284
+            text "Step size: {step}" size=sm color=#8B949E
+        }
+
+        row gap=8 {
+            btn "+Step" style=primary { count = count + step }
+            btn "-Step" { count = count - step }
+            btn "Reset" style=danger { count = 0 }
+        }
+
+        btn "Double Step" style=accent { step = step * 2 }
+    }
+}
+"#,
         );
+
         let _ = fs.write_str(
             "C:/usr/calculator.wbml",
-            "app \"Calculator\" 296 285\nvar acc = 0\nvar cur = 0\nvar op = 0\n\nrect 16 12 260 44 dark\nlabel disp 26 24 \"Val: {cur} (Mem: {acc})\"\n\nbutton b7 16 68 58 34 \"7\" { cur = cur * 10 + 7 }\nbutton b8 82 68 58 36 \"8\" { cur = cur * 10 + 8 }\nbutton b9 148 68 58 36 \"9\" { cur = cur * 10 + 9 }\nbutton bdiv 216 68 60 36 \"/\" { acc = cur; cur = 0; op = 4 }\n\nbutton b4 16 112 58 36 \"4\" { cur = cur * 10 + 4 }\nbutton b5 82 112 58 36 \"5\" { cur = cur * 10 + 5 }\nbutton b6 148 112 58 36 \"6\" { cur = cur * 10 + 6 }\nbutton bmul 216 112 60 36 \"*\" { acc = cur; cur = 0; op = 3 }\n\nbutton b1 16 156 58 36 \"1\" { cur = cur * 10 + 1 }\nbutton b2 82 156 58 36 \"2\" { cur = cur * 10 + 2 }\nbutton b3 148 156 58 36 \"3\" { cur = cur * 10 + 3 }\nbutton bsub 216 156 60 36 \"-\" { acc = cur; cur = 0; op = 2 }\n\nbutton bclr 16 200 58 36 \"C\" { acc = 0; cur = 0; op = 0 }\nbutton b0 82 200 58 36 \"0\" { cur = cur * 10 }\nbutton beq 148 200 58 36 \"=\" {\n    if op == 1 { cur = acc + cur }\n    if op == 2 { cur = acc - cur }\n    if op == 3 { cur = acc * cur }\n    if op == 4 { cur = acc / cur }\n    op = 0\n}\nbutton badd 216 200 60 36 \"+\" { acc = cur; cur = 0; op = 1 }\n",
+            r#"app "Calculator" 310 330 {
+    state {
+        acc = 0
+        cur = 0
+        op = ""
+    }
+
+    col pad=14 gap=10 {
+        card bg=#0D1117 border=#30363D pad=12 radius=6 {
+            text "{cur}" size=lg align=right color=#58F284
+            text "MEM: {acc} {op}" size=sm align=right color=#8B949E
+        }
+
+        grid cols=4 gap=8 {
+            btn "7" { cur = cur * 10 + 7 }
+            btn "8" { cur = cur * 10 + 8 }
+            btn "9" { cur = cur * 10 + 9 }
+            btn "/" style=accent { acc = cur; cur = 0; op = "/" }
+
+            btn "4" { cur = cur * 10 + 4 }
+            btn "5" { cur = cur * 10 + 5 }
+            btn "6" { cur = cur * 10 + 6 }
+            btn "*" style=accent { acc = cur; cur = 0; op = "*" }
+
+            btn "1" { cur = cur * 10 + 1 }
+            btn "2" { cur = cur * 10 + 2 }
+            btn "3" { cur = cur * 10 + 3 }
+            btn "-" style=accent { acc = cur; cur = 0; op = "-" }
+
+            btn "C" style=danger { acc = 0; cur = 0; op = "" }
+            btn "0" { cur = cur * 10 }
+            btn "=" style=primary {
+                if op == "+" { cur = acc + cur }
+                if op == "-" { cur = acc - cur }
+                if op == "*" { cur = acc * cur }
+                if op == "/" {
+                    if cur != 0 { cur = acc / cur }
+                }
+                op = ""
+            }
+            btn "+" style=accent { acc = cur; cur = 0; op = "+" }
+        }
+    }
+}
+"#,
         );
+
+        let _ = fs.write_str(
+            "C:/usr/snake.wbml",
+            r#"app "Arcade Runner" 320 330 {
+    state {
+        px = 140
+        py = 170
+        vx = 10
+        vy = 0
+        fx = 60
+        fy = 60
+        score = 0
+        alive = 1
+    }
+
+    on_tick(140) {
+        if alive == 1 {
+            px = px + vx
+            py = py + vy
+            if px < 0 { alive = 0 }
+            if px > 270 { alive = 0 }
+            if py < 0 { alive = 0 }
+            if py > 180 { alive = 0 }
+            if px == fx {
+                if py == fy {
+                    score = score + 10
+                    fx = sys.rand(1, 26) * 10
+                    fy = sys.rand(1, 17) * 10
+                }
+            }
+        }
+    }
+
+    on_key(k) {
+        if k == "ArrowUp" { vx = 0; vy = -10 }
+        if k == "ArrowDown" { vx = 0; vy = 10 }
+        if k == "ArrowLeft" { vx = -10; vy = 0 }
+        if k == "ArrowRight" { vx = 10; vy = 0 }
+        if k == "r" {
+            px = 140; py = 170; vx = 10; vy = 0; score = 0; alive = 1
+        }
+    }
+
+    col pad=14 gap=10 {
+        row gap=12 {
+            text "Score: {score}" color=#58F284
+            if alive == 0 {
+                text "GAME OVER (Press R)" color=#F85149
+            }
+        }
+
+        canvas w=288 h=196 bg=#0A0E14 {
+            rect fx fy 10 10 #FF7B72
+            rect px py 10 10 #58F284
+        }
+
+        row gap=6 {
+            btn "Left" { vx = -10; vy = 0 }
+            btn "Up" { vx = 0; vy = -10 }
+            btn "Down" { vx = 0; vy = 10 }
+            btn "Right" { vx = 10; vy = 0 }
+        }
+    }
+}
+"#,
+        );
+
         let _ = fs.write_str(
             "C:/usr/hello.wbsh",
             "# Sample WebOS shell script\necho Running hello.wbsh from C:/usr/\n@sys.mem\n",
@@ -172,7 +304,6 @@ impl FileSystem {
         }
     }
 
-    /// Returns direct children as `(name, is_dir, byte_len)`
     pub fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool, usize)>, &'static str> {
         let resolved = self.resolve_path(dir_path);
         if !matches!(self.nodes.get(&resolved), Some(FsNode::Dir)) {
