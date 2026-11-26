@@ -20,7 +20,7 @@
     }
     canvas {
       border: 1px solid #263042;
-      border-radius: 12px;
+      border-radius: 4px;
       box-shadow: 0 28px 70px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(88, 166, 255, 0.08);
       width: 1280px;
       max-width: 96vw;
@@ -36,7 +36,7 @@
       background: #161b22;
       border: 1px solid #30363d;
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: 2px;
       color: #79c0ff;
     }
   </style>
@@ -45,7 +45,7 @@
   <canvas id="display"></canvas>
   <div class="hint">
     Click <code>WebOS</code> (bottom-right) or press <code>Win / Super / F1</code> to launch apps &bull;
-    Open <code>.wbml</code> in <code>Editor</code> for live split-pane UI preview
+    Edit <code>.wbml</code> files in <code>Editor</code> and press <code>Ctrl+R</code> to build &amp; run
   </div>
 
   <script>
@@ -64,7 +64,7 @@
       };
 
       const { instance } = await WebAssembly.instantiateStreaming(
-        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=5"),
+        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=6"),
         importObject
       );
 
@@ -105,8 +105,11 @@
 
       canvas.addEventListener("wheel", (e) => {
         e.preventDefault();
-        const delta = e.deltaY > 0 ? 1011 : 1010;
-        wasm.kernel_key_input(delta);
+        if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+          wasm.kernel_key_input(e.deltaX > 0 ? 1013 : 1012);
+        } else {
+          wasm.kernel_key_input(e.deltaY > 0 ? 1011 : 1010);
+        }
       }, { passive: false });
 
       window.addEventListener("keydown", (e) => {

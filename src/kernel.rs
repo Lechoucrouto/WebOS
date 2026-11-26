@@ -1,8 +1,8 @@
 use crate::allocator::heap_stats;
 use crate::exec::{
     compile_wbml_to_wbo, expand_wbsh_line, format_wbo_inspection, install_system_binaries,
-    parse_wbml_program, ButtonStyle, DeclarativeRuntime, RenderedWidget, RenderedWidgetKind,
-    TextAlign, Value, WboExecutable, WboSubsystem,
+    ButtonStyle, DeclarativeRuntime, RenderedWidget, RenderedWidgetKind, TextAlign, Value,
+    WboExecutable, WboSubsystem,
 };
 use crate::fs::FileSystem;
 use crate::gui::{
@@ -88,7 +88,7 @@ impl Kernel {
 
         let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Editor.wbo", Some((135, 36)));
 
-        hw.serial_log("[WebOS] Booted v0.5.0 Glass & Slate + WBML v2 Live Preview.");
+        hw.serial_log("[WebOS] Booted v0.5.0 Win10 Chrome + WBML v2.");
         kernel.println("WebOS v0.5.0 (#![no_std] Rust)");
         kernel.println("Press Super/Win or click 'WebOS' (bottom-right) to launch apps.");
         kernel.println("Type 'help' for commands.");
@@ -185,26 +185,6 @@ impl Kernel {
         Ok(())
     }
 
-    fn refresh_editor_live_preview(ed: &mut EditorState) {
-        if !ed.file_path.ends_with(".wbml") {
-            ed.live_runtime = None;
-            return;
-        }
-        let src = ed.lines.join("\n");
-        match parse_wbml_program(&src) {
-            Ok((title, w, h, mut rt)) => {
-                rt.ensure_init();
-                ed.live_title = title;
-                ed.live_size = (w as i32, h as i32);
-                ed.live_runtime = Some(rt);
-                ed.status = String::from("Live Preview OK | Ctrl+S Save | Ctrl+R Run");
-            }
-            Err(err) => {
-                ed.status = format!("Syntax: {}", err);
-            }
-        }
-    }
-
     fn make_editor_state(&self, path: &str) -> EditorState {
         let resolved = self.fs.resolve_path(path);
         let content = self
@@ -215,21 +195,16 @@ impl Kernel {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        let mut ed = EditorState {
+        EditorState {
             file_path: resolved,
             lines,
             cursor_line: 0,
             cursor_col: 0,
             scroll_y: 0,
-            status: String::from("Ctrl+S Save | Ctrl+R Run"),
+            scroll_x: 0,
+            status: String::from("Ctrl+S Save | Ctrl+R Build & Run"),
             built_wbo_path: None,
-            live_runtime: None,
-            live_size: (340, 240),
-            live_title: String::from("Preview"),
-            show_guides: true,
-        };
-        Self::refresh_editor_live_preview(&mut ed);
-        ed
+        }
     }
 
     pub fn open_in_editor(&mut self, path: &str) {
@@ -420,7 +395,11 @@ impl Kernel {
                         break;
                     }
                     if x >= bx && x < bx + 142 {
-                        let is_top = self.windows.last().map(|w| w.id == win_id && !w.minimized).unwrap_or(false);
+                        let is_top = self
+                            .windows
+                            .last()
+                            .map(|w| w.id == win_id && !w.minimized)
+                            .unwrap_or(false);
                         if is_top {
                             if let Some(w) = self.windows.iter_mut().find(|w| w.id == win_id) {
                                 w.minimized = true;
@@ -437,7 +416,8 @@ impl Kernel {
         }
 
         // 4. Hit-test visible open windows from top to bottom
-        let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool, bool, bool, bool)> = None;
+        let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool, bool, bool, bool)> =
+            None;
         for win in self.windows.iter().rev() {
             if win.minimized {
                 continue;
@@ -458,7 +438,18 @@ impl Kernel {
             }
         }
 
-        if let Some((id, subsystem, win_origin, client, close_hit, max_hit, min_hit, title_hit, resize_hit)) = hit {
+        if let Some((
+            id,
+            subsystem,
+            win_origin,
+            client,
+            close_hit,
+            max_hit,
+            min_hit,
+            title_hit,
+            resize_hit,
+        )) = hit
+        {
             if close_hit {
                 if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
                     self.windows.remove(pos);
@@ -625,17 +616,9 @@ impl Kernel {
     }
 
     fn handle_editor_click(&mut self, x: i32, y: i32, client: Rect) {
-        let guides_btn = Rect::new(client.x + client.w - 328, client.y + 5, 74, 22);
         let save_btn = Rect::new(client.x + client.w - 248, client.y + 5, 62, 22);
         let build_btn = Rect::new(client.x + client.w - 180, client.y + 5, 108, 22);
         let run_btn = Rect::new(client.x + client.w - 66, client.y + 5, 56, 22);
-
-        if guides_btn.contains(x, y) {
-            if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
-                ed.show_guides = !ed.show_guides;
-            }
-            return;
-        }
 
         if save_btn.contains(x, y) {
             self.save_active_editor();
@@ -652,48 +635,13 @@ impl Kernel {
             return;
         }
 
-        let has_preview = self
-            .windows
-            .last()
-            .and_then(|w| w.editor.as_ref())
-            .map(|ed| ed.file_path.ends_with(".wbml"))
-            .unwrap_or(false);
-
-        let split_x = if has_preview {
-            client.x + (client.w * 56) / 100
-        } else {
-            client.x + client.w
-        };
-
-        // Interactive click inside Live Preview Pane!
-        if has_preview && x >= split_x {
-            let preview_area = Rect::new(
-                split_x + 12,
-                client.y + 62,
-                client.x + client.w - split_x - 24,
-                client.h - 94,
-            );
-            if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
-                if let Some(rt) = ed.live_runtime.as_mut() {
-                    let app_rect = Rect::new(
-                        preview_area.x + ((preview_area.w - ed.live_size.0) / 2).max(0),
-                        preview_area.y + ((preview_area.h - ed.live_size.1) / 2).max(0),
-                        ed.live_size.0.min(preview_area.w),
-                        ed.live_size.1.min(preview_area.h),
-                    );
-                    Self::dispatch_runtime_click(rt, app_rect, x, y, ed.show_guides);
-                }
-            }
-            return;
-        }
-
-        // Click inside code area to position cursor
+        // Click inside code area to position cursor (accounting for scroll_x & scroll_y)
         let text_top = client.y + 38;
         let text_left = client.x + 52;
-        if y >= text_top && x >= text_left && x < split_x {
+        if y >= text_top && y < client.y + client.h - 24 && x >= text_left {
             if let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) {
                 let clicked_row = ((y - text_top) / (CHAR_H as i32)) as usize;
-                let clicked_col = ((x - text_left) / (CHAR_W as i32)) as usize;
+                let clicked_col = ed.scroll_x + ((x - text_left) / (CHAR_W as i32)) as usize;
                 let target_line = (ed.scroll_y + clicked_row).min(ed.lines.len().saturating_sub(1));
                 ed.cursor_line = target_line;
                 ed.cursor_col = clicked_col.min(char_len(&ed.lines[target_line]));
@@ -752,11 +700,6 @@ impl Kernel {
         for w in &mut self.windows {
             if let Some(rt) = w.runtime.as_mut() {
                 effects.append(&mut rt.pending_effects);
-            }
-            if let Some(ed) = w.editor.as_mut() {
-                if let Some(rt) = ed.live_runtime.as_mut() {
-                    effects.append(&mut rt.pending_effects);
-                }
             }
         }
 
@@ -868,43 +811,22 @@ impl Kernel {
             return;
         }
 
-        // If user focused an input field inside the Live Preview pane, forward typing there
-        let preview_input_focused = self
+        let (visible_rows, visible_cols) = self
             .windows
             .last()
-            .and_then(|w| w.editor.as_ref())
-            .and_then(|ed| ed.live_runtime.as_ref())
-            .map(|rt| rt.focused_input.is_some())
-            .unwrap_or(false);
-
-        if preview_input_focused {
-            if let Some(kname) = Self::key_code_to_name(code) {
-                if let Some(rt) = self
-                    .windows
-                    .last_mut()
-                    .and_then(|w| w.editor.as_mut())
-                    .and_then(|ed| ed.live_runtime.as_mut())
-                {
-                    rt.on_key_event(&kname);
-                }
-            }
-            return;
-        }
-
-        let visible_rows = self
-            .windows
-            .last()
-            .map(|w| ((w.h - TITLEBAR_H - 68).max(40) as usize) / CHAR_H)
-            .unwrap_or(18);
+            .map(|w| {
+                let rows = ((w.h - TITLEBAR_H - 68).max(40) as usize) / CHAR_H;
+                let cols = ((w.w - 64).max(40) as usize) / CHAR_W;
+                (rows, cols)
+            })
+            .unwrap_or((18, 70));
 
         let Some(ed) = self.windows.last_mut().and_then(|w| w.editor.as_mut()) else {
             return;
         };
 
-        let mut modified = false;
-
         match code {
-            // Wheel Up / Down
+            // Vertical Wheel Up / Down
             1010 => {
                 ed.scroll_y = ed.scroll_y.saturating_sub(2);
                 return;
@@ -913,6 +835,15 @@ impl Kernel {
                 if ed.scroll_y + 2 < ed.lines.len() {
                     ed.scroll_y += 2;
                 }
+                return;
+            }
+            // Horizontal Wheel Left / Right
+            1012 => {
+                ed.scroll_x = ed.scroll_x.saturating_sub(4);
+                return;
+            }
+            1013 => {
+                ed.scroll_x += 4;
                 return;
             }
             // ArrowUp
@@ -956,7 +887,6 @@ impl Kernel {
                 ed.cursor_line += 1;
                 ed.lines.insert(ed.cursor_line, tail);
                 ed.cursor_col = 0;
-                modified = true;
             }
             // Backspace
             8 => {
@@ -964,13 +894,11 @@ impl Kernel {
                     ed.cursor_col -= 1;
                     let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                     ed.lines[ed.cursor_line].remove(b_idx);
-                    modified = true;
                 } else if ed.cursor_line > 0 {
                     let current = ed.lines.remove(ed.cursor_line);
                     ed.cursor_line -= 1;
                     ed.cursor_col = char_len(&ed.lines[ed.cursor_line]);
                     ed.lines[ed.cursor_line].push_str(&current);
-                    modified = true;
                 }
             }
             // Delete
@@ -978,11 +906,9 @@ impl Kernel {
                 if ed.cursor_col < char_len(&ed.lines[ed.cursor_line]) {
                     let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                     ed.lines[ed.cursor_line].remove(b_idx);
-                    modified = true;
                 } else if ed.cursor_line + 1 < ed.lines.len() {
                     let next = ed.lines.remove(ed.cursor_line + 1);
                     ed.lines[ed.cursor_line].push_str(&next);
-                    modified = true;
                 }
             }
             // Tab -> 4 spaces
@@ -990,7 +916,6 @@ impl Kernel {
                 let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                 ed.lines[ed.cursor_line].insert_str(b_idx, "    ");
                 ed.cursor_col += 4;
-                modified = true;
             }
             // Printable ASCII
             32..=126 => {
@@ -998,7 +923,6 @@ impl Kernel {
                     let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                     ed.lines[ed.cursor_line].insert(b_idx, ch);
                     ed.cursor_col += 1;
-                    modified = true;
                 }
             }
             _ => {}
@@ -1010,8 +934,10 @@ impl Kernel {
             ed.scroll_y = ed.cursor_line + 1 - visible_rows.max(1);
         }
 
-        if modified {
-            Self::refresh_editor_live_preview(ed);
+        if ed.cursor_col < ed.scroll_x {
+            ed.scroll_x = ed.cursor_col;
+        } else if ed.cursor_col >= ed.scroll_x + visible_cols.max(1) {
+            ed.scroll_x = ed.cursor_col + 1 - visible_cols.max(1);
         }
     }
 
@@ -1399,7 +1325,12 @@ impl Kernel {
                     canvas.fill_rounded_rect(w.rect, *radius, *bg);
                     canvas.stroke_rounded_rect(w.rect, *radius, *border);
                 }
-                RenderedWidgetKind::Text { text, scale, align, color } => {
+                RenderedWidgetKind::Text {
+                    text,
+                    scale,
+                    align,
+                    color,
+                } => {
                     let char_step = 5 * *scale + (*scale).max(1);
                     let text_w = (text.chars().count() as i32) * char_step;
                     let tx = match align {
@@ -1411,43 +1342,29 @@ impl Kernel {
                     canvas.draw_text_scaled(tx, ty, text, *color, *scale);
                 }
                 RenderedWidgetKind::Button { text, style, .. } => {
-                    let (top_col, bot_col, border_col) = match style {
-                        ButtonStyle::Primary => (
-                            if hovered { rgba(56, 178, 78) } else { rgba(42, 152, 64) },
-                            rgba(30, 118, 48),
-                            rgba(88, 242, 132),
-                        ),
-                        ButtonStyle::Accent => (
-                            if hovered { rgba(48, 129, 247) } else { rgba(31, 111, 235) },
-                            rgba(22, 82, 180),
-                            rgba(121, 192, 255),
-                        ),
-                        ButtonStyle::Danger => (
-                            if hovered { rgba(235, 72, 68) } else { rgba(205, 52, 48) },
-                            rgba(155, 34, 32),
-                            rgba(255, 123, 114),
-                        ),
-                        ButtonStyle::Default => (
-                            if hovered { rgba(44, 58, 80) } else { rgba(33, 44, 61) },
-                            rgba(24, 32, 46),
-                            if hovered { rgba(121, 192, 255) } else { rgba(68, 84, 108) },
-                        ),
+                    let is_primary = matches!(style, ButtonStyle::Primary | ButtonStyle::Accent);
+                    let text_col = if *style == ButtonStyle::Danger {
+                        rgba(255, 123, 114)
+                    } else {
+                        rgba(255, 255, 255)
                     };
-                    canvas.fill_gradient_v(w.rect, top_col, bot_col);
-                    canvas.stroke_rounded_rect(w.rect, 6, border_col);
-                    let text_w = (text.chars().count() * CHAR_W) as i32;
-                    let tx = w.rect.x + ((w.rect.w - text_w) / 2).max(6);
-                    let ty = w.rect.y + ((w.rect.h - 14) / 2).max(4);
-                    canvas.draw_text(tx, ty, text, rgba(255, 255, 255), top_col);
+                    canvas.draw_win10_button(w.rect, text, hovered, is_primary, text_col);
                 }
-                RenderedWidgetKind::Input { bind, text, placeholder } => {
+                RenderedWidgetKind::Input {
+                    bind,
+                    text,
+                    placeholder,
+                } => {
                     let is_active = focused_input == Some(bind.as_str());
                     let bg = rgba(10, 14, 20);
-                    canvas.fill_rounded_rect(w.rect, 5, bg);
-                    canvas.stroke_rounded_rect(
+                    canvas.fill_rect(w.rect, bg);
+                    canvas.stroke_rect(
                         w.rect,
-                        5,
-                        if is_active { rgba(88, 242, 132) } else { rgba(48, 54, 61) },
+                        if is_active {
+                            rgba(0, 120, 215)
+                        } else {
+                            rgba(62, 70, 82)
+                        },
                     );
                     let display = if text.is_empty() && !is_active {
                         placeholder.as_str()
@@ -1462,47 +1379,59 @@ impl Kernel {
                     canvas.draw_text(w.rect.x + 8, w.rect.y + 8, display, fg, bg);
                     if is_active && blink_on {
                         let cx = w.rect.x + 8 + (text.chars().count() * CHAR_W) as i32;
-                        canvas.fill_rect(Rect::new(cx, w.rect.y + 7, 2, 17), rgba(88, 242, 132));
+                        canvas.fill_rect(Rect::new(cx, w.rect.y + 7, 2, 17), rgba(0, 120, 215));
                     }
                 }
-                RenderedWidgetKind::Slider { min, max, current, .. } => {
-                    let track = Rect::new(w.rect.x + 4, w.rect.y + w.rect.h / 2 - 3, w.rect.w - 8, 6);
-                    canvas.fill_rounded_rect(track, 3, rgba(13, 17, 23));
+                RenderedWidgetKind::Slider {
+                    min, max, current, ..
+                } => {
+                    let track =
+                        Rect::new(w.rect.x + 4, w.rect.y + w.rect.h / 2 - 3, w.rect.w - 8, 6);
+                    canvas.fill_rect(track, rgba(13, 17, 23));
                     let span = (*max - *min).max(1);
-                    let fill_w = (((*current - *min).clamp(0, span) * (track.w as i64)) / span) as i32;
-                    canvas.fill_rounded_rect(
+                    let fill_w =
+                        (((*current - *min).clamp(0, span) * (track.w as i64)) / span) as i32;
+                    canvas.fill_rect(
                         Rect::new(track.x, track.y, fill_w.max(4), track.h),
-                        3,
-                        rgba(88, 166, 255),
+                        rgba(0, 120, 215),
                     );
                     canvas.fill_circle(track.x + fill_w, track.y + 3, 7, rgba(240, 246, 252));
                 }
                 RenderedWidgetKind::Toggle { label, checked, .. } => {
                     let pill = Rect::new(w.rect.x, w.rect.y + 4, 38, 20);
-                    let pill_col = if *checked { rgba(46, 160, 67) } else { rgba(48, 54, 61) };
+                    let pill_col = if *checked {
+                        rgba(0, 120, 215)
+                    } else {
+                        rgba(48, 54, 61)
+                    };
                     canvas.fill_rounded_rect(pill, 10, pill_col);
                     let knob_x = if *checked { pill.x + 28 } else { pill.x + 10 };
                     canvas.fill_circle(knob_x, pill.y + 10, 7, rgba(255, 255, 255));
-                    canvas.draw_text(w.rect.x + 48, w.rect.y + 6, label, rgba(230, 237, 243), pill_col);
+                    canvas.draw_text(
+                        w.rect.x + 48,
+                        w.rect.y + 6,
+                        label,
+                        rgba(230, 237, 243),
+                        pill_col,
+                    );
                 }
                 RenderedWidgetKind::Progress { ratio_pct, color } => {
-                    canvas.fill_rounded_rect(w.rect, 5, rgba(13, 17, 23));
-                    canvas.stroke_rounded_rect(w.rect, 5, rgba(48, 54, 61));
+                    canvas.fill_rect(w.rect, rgba(13, 17, 23));
+                    canvas.stroke_rect(w.rect, rgba(62, 70, 82));
                     let fw = ((w.rect.w - 4) * ratio_pct) / 100;
                     if fw > 0 {
-                        canvas.fill_rounded_rect(
+                        canvas.fill_rect(
                             Rect::new(w.rect.x + 2, w.rect.y + 2, fw, w.rect.h - 4),
-                            4,
                             *color,
                         );
                     }
                 }
                 RenderedWidgetKind::CanvasBox { bg, cmds } => {
-                    canvas.fill_rounded_rect(w.rect, 6, *bg);
-                    canvas.stroke_rounded_rect(w.rect, 6, rgba(48, 54, 61));
+                    canvas.fill_rect(w.rect, *bg);
+                    canvas.stroke_rect(w.rect, rgba(62, 70, 82));
                     for &(op, a, b, c, d, col) in cmds {
                         match op {
-                            0 => canvas.fill_rounded_rect(w.rect, 6, col),
+                            0 => canvas.fill_rect(w.rect, col),
                             1 => canvas.fill_rect(Rect::new(w.rect.x + a, w.rect.y + b, c, d), col),
                             2 => canvas.fill_circle(w.rect.x + a, w.rect.y + b, c, col),
                             3 => canvas.draw_line(
@@ -1524,17 +1453,11 @@ impl Kernel {
         let now_ms = hw.uptime_ms();
         let elapsed_ms = now_ms.saturating_sub(self.boot_time_ms);
         let blink_on = (now_ms / 500) % 2 == 0;
-        
 
-        // Advance timers for running DeclarativeApps and Editor Live Previews
+        // Advance timers for running DeclarativeApps
         for win in &mut self.windows {
             if let Some(rt) = win.runtime.as_mut() {
                 rt.tick(now_ms);
-            }
-            if let Some(ed) = win.editor.as_mut() {
-                if let Some(rt) = ed.live_runtime.as_mut() {
-                    rt.tick(now_ms);
-                }
             }
         }
         self.flush_runtime_effects();
@@ -1585,8 +1508,8 @@ impl Kernel {
         for (idx, (label, _, icon)) in shortcuts.iter().enumerate() {
             let srect = Rect::new(18, 22 + (idx as i32) * 78, 76, 66);
             if srect.contains(mx, my) {
-                canvas.fill_rect_alpha(srect, rgba(88, 166, 255), 35);
-                canvas.stroke_rounded_rect(srect, 8, rgba(88, 166, 255));
+                canvas.fill_rect_alpha(srect, rgba(0, 120, 215), 40);
+                canvas.stroke_rect(srect, rgba(0, 120, 215));
             }
             canvas.draw_icon(srect.x + 30, srect.y + 12, *icon);
             let tw = (label.chars().count() as i32) * 6;
@@ -1632,7 +1555,7 @@ impl Kernel {
             );
 
             canvas.set_clip(client);
-            
+
             match win.subsystem {
                 WboSubsystem::Terminal => {
                     canvas.fill_rect(client, self.term_bg);
@@ -1650,7 +1573,11 @@ impl Kernel {
                             }
                         }
                     }
-                    if is_focused && blink_on && self.cursor_x < TERM_COLS && self.cursor_y < TERM_ROWS {
+                    if is_focused
+                        && blink_on
+                        && self.cursor_x < TERM_COLS
+                        && self.cursor_y < TERM_ROWS
+                    {
                         canvas.fill_rect(
                             Rect::new(
                                 client.x + 10 + (self.cursor_x * CHAR_W) as i32,
@@ -1684,10 +1611,13 @@ impl Kernel {
                         (new_dir_btn, "+Dir"),
                         (up_btn, "Up"),
                     ] {
-                        let bg = if btn.contains(mx, my) { rgba(44, 58, 80) } else { rgba(28, 38, 54) };
-                        canvas.fill_rounded_rect(btn, 4, bg);
-                        canvas.stroke_rounded_rect(btn, 4, rgba(88, 166, 255));
-                        canvas.draw_text(btn.x + 4, btn.y + 4, lbl, rgba(230, 237, 243), bg);
+                        canvas.draw_win10_button(
+                            btn,
+                            lbl,
+                            btn.contains(mx, my),
+                            false,
+                            rgba(230, 237, 243),
+                        );
                     }
 
                     for (idx, (name, is_dir, size)) in dir_entries.iter().enumerate() {
@@ -1700,14 +1630,14 @@ impl Kernel {
                         let row_rect = Rect::new(client.x + 8, row_y - 2, client.w - 16, 22);
                         let is_selected = self.selected_path.as_deref() == Some(full.as_str());
                         let row_bg = if is_selected {
-                            rgba(31, 61, 97)
+                            rgba(0, 90, 158)
                         } else if row_rect.contains(mx, my) {
-                            rgba(24, 33, 47)
+                            rgba(28, 36, 48)
                         } else {
                             panel_bg
                         };
 
-                        canvas.fill_rounded_rect(row_rect, 4, row_bg);
+                        canvas.fill_rect(row_rect, row_bg);
                         let icon = if *is_dir {
                             IconKind::Folder
                         } else if name.ends_with(".wbo") {
@@ -1740,29 +1670,28 @@ impl Kernel {
 
                     let preview_y = client.y + client.h - 110;
                     let preview_rect = Rect::new(client.x + 8, preview_y, client.w - 16, 102);
-                    canvas.fill_rounded_rect(preview_rect, 6, rgba(11, 15, 21));
-                    canvas.stroke_rounded_rect(preview_rect, 6, rgba(48, 54, 61));
+                    canvas.fill_rect(preview_rect, rgba(11, 15, 21));
+                    canvas.stroke_rect(preview_rect, rgba(48, 54, 61));
 
                     if let Some((body, is_exec)) = &selected_preview {
                         let del_btn = Rect::new(client.x + client.w - 64, preview_y + 8, 48, 22);
-                        let action_btn = Rect::new(client.x + client.w - 124, preview_y + 8, 54, 22);
+                        let action_btn =
+                            Rect::new(client.x + client.w - 124, preview_y + 8, 54, 22);
 
-                        canvas.fill_rounded_rect(action_btn, 4, rgba(35, 134, 54));
-                        canvas.draw_text(
-                            action_btn.x + 6,
-                            action_btn.y + 4,
+                        canvas.draw_win10_button(
+                            action_btn,
                             if *is_exec { "Run" } else { "Edit" },
+                            action_btn.contains(mx, my),
+                            true,
                             rgba(255, 255, 255),
-                            rgba(35, 134, 54),
                         );
 
-                        canvas.fill_rounded_rect(del_btn, 4, rgba(165, 42, 42));
-                        canvas.draw_text(
-                            del_btn.x + 8,
-                            del_btn.y + 4,
+                        canvas.draw_win10_button(
+                            del_btn,
                             "Del",
-                            rgba(255, 255, 255),
-                            rgba(165, 42, 42),
+                            del_btn.contains(mx, my),
+                            false,
+                            rgba(255, 123, 114),
                         );
 
                         for (line_idx, line_txt) in body.lines().take(3).enumerate() {
@@ -1793,36 +1722,36 @@ impl Kernel {
                             bar_bg,
                         );
 
-                        let guides_btn = Rect::new(client.x + client.w - 328, client.y + 5, 74, 22);
                         let save_btn = Rect::new(client.x + client.w - 248, client.y + 5, 62, 22);
                         let build_btn = Rect::new(client.x + client.w - 180, client.y + 5, 108, 22);
                         let run_btn = Rect::new(client.x + client.w - 66, client.y + 5, 56, 22);
 
-                        let g_bg = if ed.show_guides { rgba(38, 56, 82) } else { rgba(28, 34, 44) };
-                        canvas.fill_rounded_rect(guides_btn, 4, g_bg);
-                        canvas.draw_text(guides_btn.x + 6, guides_btn.y + 4, "Guides", rgba(121, 192, 255), g_bg);
-
-                        canvas.fill_rounded_rect(save_btn, 4, rgba(33, 44, 61));
-                        canvas.stroke_rounded_rect(save_btn, 4, rgba(88, 166, 255));
-                        canvas.draw_text(save_btn.x + 10, save_btn.y + 4, "Save", rgba(230, 237, 243), rgba(33, 44, 61));
-
-                        canvas.fill_rounded_rect(build_btn, 4, rgba(35, 134, 54));
-                        canvas.draw_text(build_btn.x + 6, build_btn.y + 4, "Build .wbo", rgba(255, 255, 255), rgba(35, 134, 54));
-
-                        canvas.fill_rounded_rect(run_btn, 4, rgba(31, 111, 235));
-                        canvas.draw_text(run_btn.x + 12, run_btn.y + 4, "Run", rgba(255, 255, 255), rgba(31, 111, 235));
-
-                        let has_preview = ed.file_path.ends_with(".wbml");
-                        let split_x = if has_preview {
-                            client.x + (client.w * 56) / 100
-                        } else {
-                            client.x + client.w
-                        };
+                        canvas.draw_win10_button(
+                            save_btn,
+                            "Save",
+                            save_btn.contains(mx, my),
+                            false,
+                            rgba(230, 237, 243),
+                        );
+                        canvas.draw_win10_button(
+                            build_btn,
+                            "Build .wbo",
+                            build_btn.contains(mx, my),
+                            false,
+                            rgba(126, 231, 135),
+                        );
+                        canvas.draw_win10_button(
+                            run_btn,
+                            "Run",
+                            run_btn.contains(mx, my),
+                            true,
+                            rgba(255, 255, 255),
+                        );
 
                         let visible_rows = ((client.h - 60).max(20) as usize) / CHAR_H;
-                        let visible_cols = ((split_x - (client.x + 56)).max(40) as usize) / CHAR_W;
+                        let visible_cols = ((client.w - 58).max(40) as usize) / CHAR_W;
 
-                        // Gutter & Syntax-Highlighted Source Lines
+                        // Line Number Gutter
                         canvas.fill_rect(
                             Rect::new(client.x, client.y + 32, 46, client.h - 56),
                             rgba(16, 21, 29),
@@ -1836,7 +1765,12 @@ impl Kernel {
                             let py = client.y + 38 + (row * CHAR_H) as i32;
                             if line_idx == ed.cursor_line {
                                 canvas.fill_rect(
-                                    Rect::new(client.x + 46, py - 2, split_x - (client.x + 46), CHAR_H as i32),
+                                    Rect::new(
+                                        client.x + 46,
+                                        py - 2,
+                                        client.w - 46,
+                                        CHAR_H as i32,
+                                    ),
                                     rgba(20, 27, 38),
                                 );
                             }
@@ -1845,88 +1779,65 @@ impl Kernel {
                                 client.x + 6,
                                 py,
                                 &lnum,
-                                if line_idx == ed.cursor_line { rgba(121, 192, 255) } else { rgba(110, 118, 129) },
+                                if line_idx == ed.cursor_line {
+                                    rgba(121, 192, 255)
+                                } else {
+                                    rgba(110, 118, 129)
+                                },
                                 rgba(16, 21, 29),
                             );
 
                             let col_fg = Self::syntax_color_for_line(&ed.lines[line_idx]);
-                            let visible_slice: String =
-                                ed.lines[line_idx].chars().take(visible_cols).collect();
+                            let visible_slice: String = ed.lines[line_idx]
+                                .chars()
+                                .skip(ed.scroll_x)
+                                .take(visible_cols)
+                                .collect();
                             canvas.draw_text(client.x + 52, py, &visible_slice, col_fg, bg);
                         }
 
+                        // Blinking Text Cursor (respecting scroll_x and scroll_y)
                         if is_focused
                             && blink_on
                             && ed.cursor_line >= ed.scroll_y
                             && ed.cursor_line < ed.scroll_y + visible_rows
+                            && ed.cursor_col >= ed.scroll_x
+                            && ed.cursor_col <= ed.scroll_x + visible_cols
                         {
                             let vis_row = ed.cursor_line - ed.scroll_y;
-                            let vis_col = ed.cursor_col.min(visible_cols);
+                            let vis_col = ed.cursor_col - ed.scroll_x;
                             let cx = client.x + 52 + (vis_col * CHAR_W) as i32;
                             let cy = client.y + 38 + (vis_row * CHAR_H) as i32;
                             canvas.fill_rect(Rect::new(cx, cy, 2, 16), rgba(88, 242, 132));
                         }
 
-                        // Right Split-Pane: LIVE INTERACTIVE WBML PREVIEW
-                        if has_preview {
-                            let pane_w = client.x + client.w - split_x;
-                            let pane_rect = Rect::new(split_x, client.y + 32, pane_w, client.h - 56);
-                            canvas.fill_rect(pane_rect, rgba(10, 14, 20));
-                            canvas.fill_rect(Rect::new(split_x, client.y + 32, 1, client.h - 56), rgba(48, 54, 61));
-
-                            let header_label = format!(
-                                "LIVE PREVIEW: \"{}\" ({}x{})",
-                                ed.live_title, ed.live_size.0, ed.live_size.1
-                            );
-                            canvas.draw_text_scaled(
-                                split_x + 12,
-                                client.y + 42,
-                                &header_label,
-                                rgba(121, 192, 255),
-                                1,
-                            );
-
-                            let show_guides = ed.show_guides;
-                            if let Some(rt) = ed.live_runtime.as_mut() {
-                                let preview_area = Rect::new(
-                                    split_x + 12,
-                                    client.y + 62,
-                                    pane_w - 24,
-                                    client.h - 94,
-                                );
-                                let app_w = ed.live_size.0.min(preview_area.w);
-                                let app_h = ed.live_size.1.min(preview_area.h);
-                                let app_rect = Rect::new(
-                                    preview_area.x + ((preview_area.w - app_w) / 2).max(0),
-                                    preview_area.y + ((preview_area.h - app_h) / 2).max(0),
-                                    app_w,
-                                    app_h,
-                                );
-
-                                canvas.fill_rounded_rect(app_rect, 8, rgba(16, 21, 29));
-                                canvas.stroke_rounded_rect(app_rect, 8, rgba(88, 166, 255));
-
-                                let widgets = rt.layout(app_rect, show_guides);
-                                Self::render_declarative_widgets(
-                                    &mut canvas,
-                                    &widgets,
-                                    rt.focused_input.as_deref(),
-                                    mx,
-                                    my,
-                                    blink_on,
-                                );
-                            }
-                        }
-
                         // Status Footer
                         let status_y = client.y + client.h - 24;
                         canvas.fill_rect(Rect::new(client.x, status_y, client.w, 24), bar_bg);
-                        let st_col = if ed.status.starts_with("Syntax") || ed.status.starts_with("Compile") {
+                        let st_col = if ed.status.starts_with("Syntax")
+                            || ed.status.starts_with("Compile")
+                            || ed.status.starts_with("Save error")
+                        {
                             rgba(255, 123, 114)
                         } else {
                             rgba(126, 231, 135)
                         };
                         canvas.draw_text(client.x + 10, status_y + 4, &ed.status, st_col, bar_bg);
+
+                        let pos_label = format!(
+                            "Ln {}, Col {}",
+                            ed.cursor_line + 1,
+                            ed.cursor_col + 1
+                        );
+                        let pos_x =
+                            client.x + client.w - (pos_label.chars().count() as i32 * CHAR_W as i32) - 14;
+                        canvas.draw_text(
+                            pos_x,
+                            status_y + 4,
+                            &pos_label,
+                            rgba(139, 148, 158),
+                            bar_bg,
+                        );
                     }
                 }
                 WboSubsystem::SysMon => {
@@ -1939,19 +1850,23 @@ impl Kernel {
                     canvas.draw_text(
                         client.x + 14,
                         client.y + 14,
-                        &format!("Kernel Heap: {} / {} KiB ({:.1}%)", used / 1024, total / 1024, pct),
+                        &format!(
+                            "Kernel Heap: {} / {} KiB ({:.1}%)",
+                            used / 1024,
+                            total / 1024,
+                            pct
+                        ),
                         rgba(230, 237, 243),
                         panel_bg,
                     );
 
                     let bar_rect = Rect::new(client.x + 14, client.y + 42, client.w - 28, 22);
-                    canvas.fill_rounded_rect(bar_rect, 6, rgba(10, 14, 20));
-                    canvas.stroke_rounded_rect(bar_rect, 6, rgba(48, 54, 61));
+                    canvas.fill_rect(bar_rect, rgba(10, 14, 20));
+                    canvas.stroke_rect(bar_rect, rgba(48, 54, 61));
                     let fill_w = (((bar_rect.w - 4) as f64) * (pct / 100.0)) as i32;
-                    canvas.fill_rounded_rect(
+                    canvas.fill_rect(
                         Rect::new(bar_rect.x + 2, bar_rect.y + 2, fill_w.max(6), bar_rect.h - 4),
-                        4,
-                        rgba(88, 242, 132),
+                        rgba(0, 120, 215),
                     );
 
                     canvas.draw_text(
@@ -2000,12 +1915,15 @@ impl Kernel {
         // 3. Bottom-Right Searchable WebOS Launcher Popup
         if self.launcher_open {
             canvas.reset_clip();
-            canvas.draw_shadow(launcher_rect, 10);
             let l_bg = rgba(20, 26, 36);
-            canvas.fill_rounded_rect(launcher_rect, 10, l_bg);
-            canvas.stroke_rounded_rect(launcher_rect, 10, rgba(88, 166, 255));
+            canvas.fill_rect(launcher_rect, l_bg);
+            canvas.stroke_rect(launcher_rect, rgba(0, 120, 215));
 
-            canvas.draw_icon(launcher_rect.x + 14, launcher_rect.y + 12, IconKind::WebOsLogo);
+            canvas.draw_icon(
+                launcher_rect.x + 14,
+                launcher_rect.y + 12,
+                IconKind::WebOsLogo,
+            );
             canvas.draw_text(
                 launcher_rect.x + 38,
                 launcher_rect.y + 11,
@@ -2014,10 +1932,15 @@ impl Kernel {
                 l_bg,
             );
 
-            let search_box = Rect::new(launcher_rect.x + 14, launcher_rect.y + 40, launcher_rect.w - 28, 30);
+            let search_box = Rect::new(
+                launcher_rect.x + 14,
+                launcher_rect.y + 40,
+                launcher_rect.w - 28,
+                30,
+            );
             let s_bg = rgba(11, 15, 22);
-            canvas.fill_rounded_rect(search_box, 6, s_bg);
-            canvas.stroke_rounded_rect(search_box, 6, rgba(88, 242, 132));
+            canvas.fill_rect(search_box, s_bg);
+            canvas.stroke_rect(search_box, rgba(0, 120, 215));
 
             let prompt_txt = if self.launcher_query.is_empty() {
                 "Type to filter apps..."
@@ -2035,11 +1958,11 @@ impl Kernel {
                 let row_y = launcher_rect.y + 84 + (idx as i32) * 30;
                 let row_rect = Rect::new(launcher_rect.x + 14, row_y, launcher_rect.w - 28, 26);
                 let row_bg = if idx == 0 || row_rect.contains(mx, my) {
-                    rgba(31, 61, 97)
+                    rgba(0, 90, 158)
                 } else {
                     l_bg
                 };
-                canvas.fill_rounded_rect(row_rect, 5, row_bg);
+                canvas.fill_rect(row_rect, row_bg);
                 let icon = match app_name.as_str() {
                     "Terminal" => IconKind::Terminal,
                     "Files" => IconKind::Files,
@@ -2058,39 +1981,42 @@ impl Kernel {
             }
         }
 
-        // 4. Bottom Glass & Slate Taskbar
+        // 4. Bottom Windows 10 Taskbar
         canvas.reset_clip();
         let tb_y = FB_HEIGHT as i32 - TASKBAR_H;
-        let tb_bg = rgba(17, 22, 32);
+        let tb_bg = rgba(16, 20, 26);
         canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, TASKBAR_H), tb_bg);
-        canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, 1), rgba(44, 56, 74));
+        canvas.fill_rect(Rect::new(0, tb_y, FB_WIDTH as i32, 1), rgba(46, 54, 66));
 
         let mut bx = 12;
         for (_, title, subsys, is_focused) in taskbar_items {
             if bx + 148 > launcher_btn.x - 140 {
                 break;
             }
-            let btn_rect = Rect::new(bx, tb_y + 6, 142, TASKBAR_H - 12);
+            let btn_rect = Rect::new(bx, tb_y + 4, 142, TASKBAR_H - 8);
             let btn_bg = if is_focused {
-                rgba(33, 47, 68)
+                rgba(36, 44, 56)
             } else if btn_rect.contains(mx, my) {
-                rgba(26, 36, 52)
+                rgba(28, 34, 44)
             } else {
-                rgba(21, 28, 40)
+                rgba(22, 27, 35)
             };
-            canvas.fill_rounded_rect(btn_rect, 6, btn_bg);
-            canvas.stroke_rounded_rect(
+            canvas.fill_rect(btn_rect, btn_bg);
+            canvas.stroke_rect(
                 btn_rect,
-                6,
-                if is_focused { rgba(88, 166, 255) } else { rgba(42, 52, 68) },
+                if is_focused {
+                    rgba(0, 120, 215)
+                } else {
+                    rgba(46, 54, 66)
+                },
             );
             canvas.draw_icon(bx + 8, tb_y + 13, Self::subsys_icon(subsys));
             let short_title: String = title.chars().take(8).collect();
             canvas.draw_text(bx + 30, tb_y + 13, &short_title, rgba(235, 241, 248), btn_bg);
             if is_focused {
                 canvas.fill_rect(
-                    Rect::new(bx + 44, tb_y + TASKBAR_H - 4, 54, 2),
-                    rgba(88, 166, 255),
+                    Rect::new(bx, tb_y + TASKBAR_H - 3, 142, 3),
+                    rgba(0, 120, 215),
                 );
             }
             bx += 148;
@@ -2106,20 +2032,20 @@ impl Kernel {
             tb_bg,
         );
 
-        let wb_top = if self.launcher_open || launcher_btn.contains(mx, my) {
-            rgba(52, 174, 74)
+        let wb_bg = if self.launcher_open || launcher_btn.contains(mx, my) {
+            rgba(24, 144, 240)
         } else {
-            rgba(38, 142, 58)
+            rgba(0, 120, 215)
         };
-        canvas.fill_gradient_v(launcher_btn, wb_top, rgba(26, 108, 44));
-        canvas.stroke_rounded_rect(launcher_btn, 7, rgba(126, 231, 135));
+        canvas.fill_rect(launcher_btn, wb_bg);
+        canvas.stroke_rect(launcher_btn, rgba(38, 148, 235));
         canvas.draw_icon(launcher_btn.x + 10, launcher_btn.y + 7, IconKind::WebOsLogo);
         canvas.draw_text(
             launcher_btn.x + 34,
             launcher_btn.y + 7,
             "WebOS",
             rgba(255, 255, 255),
-            wb_top,
+            wb_bg,
         );
 
         // 5. Mouse Cursor

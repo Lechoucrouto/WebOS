@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 pub const FB_WIDTH: usize = 1280;
 pub const FB_HEIGHT: usize = 720;
 pub const TASKBAR_H: i32 = 42;
-pub const TITLEBAR_H: i32 = 32;
+pub const TITLEBAR_H: i32 = 30;
 
 pub const CHAR_W: usize = 11;
 pub const CHAR_H: usize = 19;
@@ -33,7 +33,6 @@ pub fn blend_rgba(fg: u32, bg: u32, alpha: u8) -> u32 {
 
     r | (g << 8) | (b << 16) | (0xFF << 24)
 }
-
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -81,12 +80,9 @@ pub struct EditorState {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub scroll_y: usize,
+    pub scroll_x: usize,
     pub status: String,
     pub built_wbo_path: Option<String>,
-    pub live_runtime: Option<DeclarativeRuntime>,
-    pub live_size: (i32, i32),
-    pub live_title: String,
-    pub show_guides: bool,
 }
 
 pub struct Window {
@@ -186,7 +182,7 @@ impl<'a> Canvas<'a> {
 
         let tx = r.x + (r.w - (label.chars().count() as i32 * CHAR_W as i32)) / 2;
         let ty = r.y + (r.h - CHAR_H as i32) / 2;
-        self.draw_text(tx.max(r.x + 6), ty, label, text_color, bg);
+        self.draw_text(tx.max(r.x + 4), ty, label, text_color, bg);
     }
 
     pub fn draw_win10_window_chrome(
@@ -658,14 +654,12 @@ impl<'a> Canvas<'a> {
             rgba(18, 27, 44),
         );
 
-        // Subtle atmospheric horizon glow
         self.fill_rect_alpha(
             Rect::new(0, desk_h - 160, FB_WIDTH as i32, 160),
             rgba(36, 68, 118),
             26,
         );
 
-        // Crisp architectural dot matrix
         let dot = rgba(46, 63, 88);
         let mut y = 28;
         while y < desk_h {
