@@ -1524,6 +1524,7 @@ impl Kernel {
         let now_ms = hw.uptime_ms();
         let elapsed_ms = now_ms.saturating_sub(self.boot_time_ms);
         let blink_on = (now_ms / 500) % 2 == 0;
+        
 
         // Advance timers for running DeclarativeApps and Editor Live Previews
         for win in &mut self.windows {
@@ -1606,65 +1607,32 @@ impl Kernel {
             }
             let is_focused = Some(win.id) == top_win_id;
             let frame = win.frame_rect();
-            let titlebar = win.titlebar_rect();
             let close_btn = win.close_btn_rect();
             let max_btn = win.max_btn_rect();
             let min_btn = win.min_btn_rect();
             let client = win.client_rect();
 
-            let border_col = if is_focused {
-                rgba(88, 166, 255)
+            let hover_btn = if close_btn.contains(mx, my) {
+                3
+            } else if max_btn.contains(mx, my) {
+                2
+            } else if min_btn.contains(mx, my) {
+                1
             } else {
-                rgba(48, 58, 74)
-            };
-            let title_top = if is_focused {
-                rgba(33, 46, 68)
-            } else {
-                rgba(22, 29, 41)
-            };
-            let title_bot = if is_focused {
-                rgba(22, 31, 46)
-            } else {
-                rgba(17, 22, 31)
+                0
             };
 
-            canvas.reset_clip();
-            if !win.maximized {
-                canvas.draw_shadow(frame, 8);
-            }
-            canvas.fill_rounded_rect(frame, if win.maximized { 0 } else { 8 }, rgba(15, 20, 29));
-            canvas.stroke_rounded_rect(frame, if win.maximized { 0 } else { 8 }, border_col);
-
-            canvas.set_clip(titlebar);
-            canvas.fill_gradient_v(titlebar, title_top, title_bot);
-            canvas.fill_rect(
-                Rect::new(titlebar.x, titlebar.y + titlebar.h - 1, titlebar.w, 1),
-                rgba(42, 54, 72),
-            );
-            canvas.draw_icon(titlebar.x + 10, titlebar.y + 8, Self::subsys_icon(win.subsystem));
-            canvas.draw_text(
-                titlebar.x + 32,
-                titlebar.y + 8,
+            canvas.draw_win10_window_chrome(
+                frame,
                 &win.title,
-                rgba(235, 241, 248),
-                title_top,
+                Self::subsys_icon(win.subsystem),
+                is_focused,
+                win.maximized,
+                hover_btn,
             );
-
-            // Window control buttons (Min, Max, Close)
-            let min_col = if min_btn.contains(mx, my) { rgba(62, 76, 98) } else { rgba(38, 48, 64) };
-            canvas.fill_rounded_rect(min_btn, 4, min_col);
-            canvas.fill_rect(Rect::new(min_btn.x + 5, min_btn.y + 13, 10, 2), rgba(230, 237, 243));
-
-            let max_col = if max_btn.contains(mx, my) { rgba(62, 76, 98) } else { rgba(38, 48, 64) };
-            canvas.fill_rounded_rect(max_btn, 4, max_col);
-            canvas.stroke_rect(Rect::new(max_btn.x + 5, max_btn.y + 5, 10, 10), rgba(230, 237, 243));
-
-            let close_col = if close_btn.contains(mx, my) { rgba(240, 72, 68) } else { rgba(205, 52, 48) };
-            canvas.fill_rounded_rect(close_btn, 4, close_col);
-            canvas.draw_line(close_btn.x + 6, close_btn.y + 6, close_btn.x + 13, close_btn.y + 13, rgba(255, 255, 255));
-            canvas.draw_line(close_btn.x + 13, close_btn.y + 6, close_btn.x + 6, close_btn.y + 13, rgba(255, 255, 255));
 
             canvas.set_clip(client);
+            
             match win.subsystem {
                 WboSubsystem::Terminal => {
                     canvas.fill_rect(client, self.term_bg);
