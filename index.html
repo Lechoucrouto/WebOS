@@ -2,246 +2,186 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>WebOS — Rust #![no_std] Desktop in WebAssembly</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebOS</title>
   <style>
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      margin: 0;
-      min-height: 100vh;
-      background: radial-gradient(circle at 50% 20%, #111827 0%, #05070b 100%);
+      background: #07090d;
       color: #c9d1d9;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 12px;
+      min-height: 100vh;
+      overflow: hidden;
       user-select: none;
     }
-    canvas {
-      border: 1px solid #263042;
-      border-radius: 4px;
-      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(88, 166, 255, 0.08);
-      width: 1280px;
-      max-width: 96vw;
-      height: auto;
-      cursor: none;
+    #screen-wrap {
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.8);
+      background: #000;
     }
-    .hint {
+    canvas {
+      display: block;
+      width: 1024px;
+      height: 640px;
+      cursor: none;
+      image-rendering: pixelated;
+    }
+    #hint {
+      margin-top: 10px;
       font-size: 12px;
       color: #8b949e;
-      letter-spacing: 0.3px;
-    }
-    code {
-      background: #161b22;
-      border: 1px solid #30363d;
-      padding: 2px 6px;
-      border-radius: 2px;
-      color: #79c0ff;
     }
   </style>
 </head>
 <body>
-  <canvas id="display"></canvas>
-  <div class="hint">
-    Click <code>WebOS</code> (bottom-right) or press <code>Win / Super / F1</code> to launch apps &bull;
-    Edit <code>.wbml</code> files in <code>Editor</code> and press <code>Ctrl+R</code> to build &amp; run
+  <div id="screen-wrap">
+    <canvas id="os-canvas" width="1024" height="640" tabindex="0"></canvas>
   </div>
+  <div id="hint">WebOS Kernel • Persistent Storage Enabled • Click canvas to focus</div>
 
-  <script>
-    async function boot() {
-      let wasmMemory;
-      const decoder = new TextDecoder("utf-8");
-      const STORAGE_KEY = "webos_fs_v1";
+  <script type="module">
+    import init, { boot_webos } from "./pkg/webos.js";
 
-      function bytesToBase64(bytes) {
-        let bin = "";
-        for (let i = 0; i < bytes.length; i++) {
-          bin += String.fromCharCode(bytes[i]);
-        }
-        return btoa(bin);
-      }
+    async function main() {
+      const wasm = await init();
+      const os = boot_webos();
 
-      function base64ToBytes(b64) {
-        const bin = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) {
-          bytes[i] = bin.charCodeAt(i);
-        }
-        return bytes;
-      }
+      const width = os.width();
+      const height = os.height();
+      const canvas = document.getElementById("os-canvas");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const imgData = ctx.createImageData(width, height);
 
-      const importObject = {
-        env: {
-          js_now_ms: () => performance.now(),
-          js_console_log: (ptr, len) => {
-            const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
-            console.log(decoder.decode(bytes));
-          },
-          js_storage_save: (ptr, len) => {
-            try {
-              const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
-              localStorage.setItem(STORAGE_KEY, bytesToBase64(bytes));
-            } catch (err) {
-              console.warn("WebOS storage save failed:", err);
-            }
-          },
-          js_storage_len: () => {
-            try {
-              const raw = localStorage.getItem(STORAGE_KEY);
-              if (!raw) return 0;
-              return base64ToBytes(raw).length;
-            } catch (_) {
-              return 0;
-            }
-          },
-          js_storage_read: (ptr, maxLen) => {
-            try {
-              const raw = localStorage.getItem(STORAGE_KEY);
-              if (!raw) return 0;
-              const bytes = base64ToBytes(raw);
-              const count = Math.min(bytes.length, maxLen);
-              new Uint8Array(wasmMemory.buffer, ptr, count).set(bytes.subarray(0, count));
-              return count;
-            } catch (_) {
-              return 0;
-            }
-          },
-          js_factory_reset: async () => {
-            try {
-              localStorage.clear();
-              sessionStorage.clear();
-              if (window.indexedDB && indexedDB.databases) {
-                const dbs = await indexedDB.databases();
-                for (const db of dbs) {
-                  if (db.name) indexedDB.deleteDatabase(db.name);
-                }
-              }
-              if (window.caches) {
-                const keys = await caches.keys();
-                await Promise.all(keys.map((k) => caches.delete(k)));
-              }
-            } catch (_) {}
-
-            const url = new URL(window.location.href);
-            url.searchParams.set("reset", Date.now().toString());
-            window.location.replace(url.toString());
-          },
-        },
-      };
-
-      const { instance } = await WebAssembly.instantiateStreaming(
-        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=" + Date.now(), {
-          cache: "no-store",
-        }),
-        importObject
-      );
-
-      const wasm = instance.exports;
-      wasmMemory = wasm.memory;
-
-      wasm.kernel_boot();
-
-      const width = wasm.fb_width();
-      const height = wasm.fb_height();
-      const canvas = document.getElementById("display");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
-
-      function mapCoords(e) {
+      function canvasCoords(e) {
         const rect = canvas.getBoundingClientRect();
-        const x = Math.floor(((e.clientX - rect.left) / rect.width) * width);
-        const y = Math.floor(((e.clientY - rect.top) / rect.height) * height);
-        return [x, y];
+        const scaleX = width / rect.width;
+        const scaleY = height / rect.height;
+        return {
+          x: Math.floor((e.clientX - rect.left) * scaleX),
+          y: Math.floor((e.clientY - rect.top) * scaleY),
+        };
       }
 
       canvas.addEventListener("mousemove", (e) => {
-        const [x, y] = mapCoords(e);
-        wasm.kernel_mouse_move(x, y);
+        const { x, y } = canvasCoords(e);
+        os.on_mouse_move(x, y);
       });
 
       canvas.addEventListener("mousedown", (e) => {
-        e.preventDefault();
-        const [x, y] = mapCoords(e);
-        wasm.kernel_mouse_down(x, y, e.button);
+        canvas.focus();
+        const { x, y } = canvasCoords(e);
+        os.on_mouse_down(x, y, e.button);
       });
 
       window.addEventListener("mouseup", (e) => {
-        const [x, y] = mapCoords(e);
-        wasm.kernel_mouse_up(x, y, e.button);
+        const { x, y } = canvasCoords(e);
+        os.on_mouse_up(x, y, e.button);
       });
 
-      canvas.addEventListener("wheel", (e) => {
-        e.preventDefault();
-        if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-          wasm.kernel_key_input(e.deltaX > 0 ? 1013 : 1012);
-        } else {
-          wasm.kernel_key_input(e.deltaY > 0 ? 1011 : 1010);
-        }
-      }, { passive: false });
+      canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+      canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          os.on_wheel(Math.sign(e.deltaX), Math.sign(e.deltaY));
+        },
+        { passive: false }
+      );
 
       window.addEventListener("keydown", (e) => {
-        if (e.key === "Meta" || e.key === "OS" || e.key === "F1") {
-          e.preventDefault();
-          wasm.kernel_key_input(1005);
+        if (document.activeElement !== canvas && document.activeElement !== document.body) {
           return;
         }
+        const ctrl = e.ctrlKey || e.metaKey;
 
-        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        if (ctrl && (e.key === "s" || e.key === "S")) {
           e.preventDefault();
-          wasm.kernel_key_input(2001);
+          os.on_key(1001);
           return;
         }
-
-        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "r") {
+        if (ctrl && (e.key === "b" || e.key === "B")) {
           e.preventDefault();
-          wasm.kernel_key_input(2002);
+          os.on_key(1002);
           return;
         }
-
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-        const specialKeys = {
-          Backspace: 8,
-          Tab: 9,
-          Enter: 13,
-          Escape: 27,
-          Delete: 127,
-          ArrowUp: 1001,
-          ArrowDown: 1002,
-          ArrowLeft: 1003,
-          ArrowRight: 1004,
-          PageUp: 1006,
-          PageDown: 1007,
-          Home: 1008,
-          End: 1009,
-        };
-
-        if (specialKeys[e.key] !== undefined) {
+        if (ctrl && (e.key === "r" || e.key === "R")) {
           e.preventDefault();
-          wasm.kernel_key_input(specialKeys[e.key]);
-        } else if (e.key.length === 1) {
+          os.on_key(1003);
+          return;
+        }
+        if (ctrl && (e.key === "g" || e.key === "G")) {
           e.preventDefault();
-          const code = e.key.charCodeAt(0);
-          if (code >= 32 && code <= 126) {
-            wasm.kernel_key_input(code);
-          }
+          os.on_key(1004);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          os.on_key(27);
+          return;
+        }
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          os.on_key(8);
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          os.on_key(13);
+          return;
+        }
+        if (e.key === "Tab") {
+          e.preventDefault();
+          os.on_key(9);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          os.on_key(38);
+          return;
+        }
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          os.on_key(40);
+          return;
+        }
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          os.on_key(37);
+          return;
+        }
+        if (e.key === "ArrowRight") {
+          e.preventDefault();
+          os.on_key(39);
+          return;
+        }
+        if (!ctrl && !e.altKey && e.key.length === 1) {
+          e.preventDefault();
+          os.on_key(e.key.charCodeAt(0));
         }
       });
 
       function frame() {
-        wasm.kernel_tick();
-        const ptr = wasm.fb_ptr();
-        const pixels = new Uint8ClampedArray(wasmMemory.buffer, ptr, width * height * 4);
-        ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+        os.tick();
+        const ptr = os.framebuffer_ptr();
+        const len = os.framebuffer_len();
+        const view = new Uint8ClampedArray(wasm.memory.buffer, ptr, len * 4);
+        imgData.data.set(view);
+        ctx.putImageData(imgData, 0, 0);
         requestAnimationFrame(frame);
       }
 
+      canvas.focus();
       requestAnimationFrame(frame);
     }
 
-    boot();
+    main();
   </script>
 </body>
 </html>

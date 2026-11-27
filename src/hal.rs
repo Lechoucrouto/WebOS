@@ -1,9 +1,7 @@
-use alloc::vec::Vec;
-
 pub trait Hardware {
-    fn uptime_ms(&self) -> u64;
+    fn now_ms(&self) -> f64;
     fn serial_log(&self, msg: &str);
-    fn storage_save(&self, data: &[u8]);
-    fn storage_load(&self) -> Option<Vec<u8>>;
+    fn storage_save(&self, data: &str);
+    fn storage_load(&self) -> Option<String>;
     fn factory_reset(&self);
 }
