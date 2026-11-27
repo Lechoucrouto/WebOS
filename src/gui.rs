@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 pub const FB_WIDTH: usize = 1280;
 pub const FB_HEIGHT: usize = 720;
 pub const TASKBAR_H: i32 = 42;
-pub const TITLEBAR_H: i32 = 30;
+pub const TITLEBAR_H: i32 = 32;
 
 pub const CHAR_W: usize = 11;
 pub const CHAR_H: usize = 19;
@@ -33,6 +33,7 @@ pub fn blend_rgba(fg: u32, bg: u32, alpha: u8) -> u32 {
 
     r | (g << 8) | (b << 16) | (0xFF << 24)
 }
+
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -66,6 +67,7 @@ pub enum IconKind {
     Files,
     Editor,
     SysMon,
+    Settings,
     AppBinary,
     Blueprint,
     Script,
@@ -80,9 +82,12 @@ pub struct EditorState {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub scroll_y: usize,
-    pub scroll_x: usize,
     pub status: String,
     pub built_wbo_path: Option<String>,
+    pub live_runtime: Option<DeclarativeRuntime>,
+    pub live_size: (i32, i32),
+    pub live_title: String,
+    pub show_guides: bool,
 }
 
 pub struct Window {
@@ -182,7 +187,7 @@ impl<'a> Canvas<'a> {
 
         let tx = r.x + (r.w - (label.chars().count() as i32 * CHAR_W as i32)) / 2;
         let ty = r.y + (r.h - CHAR_H as i32) / 2;
-        self.draw_text(tx.max(r.x + 4), ty, label, text_color, bg);
+        self.draw_text(tx.max(r.x + 6), ty, label, text_color, bg);
     }
 
     pub fn draw_win10_window_chrome(
@@ -619,6 +624,12 @@ impl<'a> Canvas<'a> {
                 self.draw_line(x + 8, y + 5, x + 10, y + 12, rgba(88, 242, 132));
                 self.draw_line(x + 10, y + 12, x + 13, y + 8, rgba(88, 242, 132));
             }
+            IconKind::Settings => {
+                self.fill_rounded_rect(Rect::new(x + 1, y + 1, 14, 14), 3, rgba(28, 36, 48));
+                self.stroke_rounded_rect(Rect::new(x + 1, y + 1, 14, 14), 3, rgba(139, 148, 158));
+                self.fill_circle(x + 8, y + 8, 4, rgba(88, 166, 255));
+                self.fill_circle(x + 8, y + 8, 2, rgba(28, 36, 48));
+            }
             IconKind::AppBinary => {
                 self.fill_rounded_rect(Rect::new(x + 1, y + 1, 14, 14), 4, rgba(35, 105, 62));
                 self.stroke_rounded_rect(Rect::new(x + 1, y + 1, 14, 14), 4, rgba(126, 231, 135));
@@ -654,12 +665,14 @@ impl<'a> Canvas<'a> {
             rgba(18, 27, 44),
         );
 
+        // Subtle atmospheric horizon glow
         self.fill_rect_alpha(
             Rect::new(0, desk_h - 160, FB_WIDTH as i32, 160),
             rgba(36, 68, 118),
             26,
         );
 
+        // Crisp architectural dot matrix
         let dot = rgba(46, 63, 88);
         let mut y = 28;
         while y < desk_h {
@@ -669,6 +682,21 @@ impl<'a> Canvas<'a> {
                 x += 36;
             }
             y += 36;
+        }
+    }
+
+    pub fn apply_brightness(&mut self, brightness_pct: u8) {
+        let pct = brightness_pct.clamp(20, 100) as u32;
+        if pct >= 100 {
+            return;
+        }
+        let scale = (pct * 256) / 100;
+        for px in self.buf.iter_mut() {
+            let c = *px;
+            let r = ((c & 0xFF) * scale) >> 8;
+            let g = (((c >> 8) & 0xFF) * scale) >> 8;
+            let b = (((c >> 16) & 0xFF) * scale) >> 8;
+            *px = r | (g << 8) | (b << 16) | 0xFF00_0000;
         }
     }
 

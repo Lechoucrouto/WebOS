@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 const TERM_COLS: usize = 56;
 const TERM_ROWS: usize = 19;
+const FACTORY_RESET_PHRASE: &str = "WebOS Factory Reset";
 
 fn char_to_byte_idx(s: &str, char_col: usize) -> usize {
     s.char_indices()
@@ -35,10 +36,17 @@ pub struct Kernel {
     next_win_id: usize,
     dragging_win_id: Option<usize>,
     resizing_win_id: Option<usize>,
+    dragging_slider: Option<u8>,
     drag_offset_x: i32,
     drag_offset_y: i32,
     mouse_x: i32,
     mouse_y: i32,
+
+    brightness: u8,
+    volume: u8,
+
+    reset_modal_stage: u8,
+    reset_input: String,
 
     launcher_open: bool,
     launcher_query: String,
@@ -60,7 +68,25 @@ pub struct Kernel {
 impl Kernel {
     pub fn boot(hw: &dyn Hardware) -> Self {
         let mut fs = FileSystem::new();
+        if let Some(saved_blob) = hw.storage_load() {
+            if fs.import_persistent_blob(&saved_blob) {
+                hw.serial_log("[WebOS] Restored persistent filesystem from browser storage.");
+            }
+        }
         install_system_binaries(&mut fs);
+        fs.dirty = false;
+
+        let mut brightness: u8 = 100;
+        let mut volume: u8 = 75;
+        if let Some(cfg) = fs.read_str("C:/WebOS/settings.cfg") {
+            for line in cfg.lines() {
+                if let Some(v) = line.strip_prefix("brightness=") {
+                    brightness = v.trim().parse::<u8>().unwrap_or(100).clamp(20, 100);
+                } else if let Some(v) = line.strip_prefix("volume=") {
+                    volume = v.trim().parse::<u8>().unwrap_or(75).clamp(0, 100);
+                }
+            }
+        }
 
         let mut kernel = Self {
             framebuffer: vec![rgba(10, 15, 26); FB_WIDTH * FB_HEIGHT],
@@ -68,10 +94,15 @@ impl Kernel {
             next_win_id: 1,
             dragging_win_id: None,
             resizing_win_id: None,
+            dragging_slider: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
             mouse_x: (FB_WIDTH / 2) as i32,
             mouse_y: (FB_HEIGHT / 2) as i32,
+            brightness,
+            volume,
+            reset_modal_stage: 0,
+            reset_input: String::new(),
             launcher_open: false,
             launcher_query: String::new(),
             term_grid: vec![' '; TERM_COLS * TERM_ROWS],
@@ -88,13 +119,26 @@ impl Kernel {
 
         let _ = kernel.exec_wbo("C:/WebOS/bin/Apps/Editor.wbo", Some((135, 36)));
 
-        hw.serial_log("[WebOS] Booted v0.5.0 Win10 Chrome + WBML v2.");
-        kernel.println("WebOS v0.5.0 (#![no_std] Rust)");
-        kernel.println("Press Super/Win or click 'WebOS' (bottom-right) to launch apps.");
+        hw.serial_log("[WebOS] Booted v0.6.0 Persistent Storage + Settings.");
+        kernel.println("WebOS v0.6.0 (#![no_std] Rust)");
+        kernel.println("Persistent Storage enabled. Open Settings to configure OS.");
         kernel.println("Type 'help' for commands.");
         kernel.println("");
         kernel.print_prompt();
         kernel
+    }
+
+    fn persist_settings(&mut self) {
+        let cfg = format!("brightness={}\nvolume={}\n", self.brightness, self.volume);
+        let _ = self.fs.write_str("C:/WebOS/settings.cfg", &cfg);
+    }
+
+    fn sync_persistence(&mut self, hw: &dyn Hardware) {
+        if self.fs.dirty {
+            let blob = self.fs.export_persistent_blob();
+            hw.storage_save(&blob);
+            self.fs.dirty = false;
+        }
     }
 
     fn print_prompt(&mut self) {
@@ -308,9 +352,42 @@ impl Kernel {
         Ok(out_path)
     }
 
+    fn update_settings_slider_from_mouse(&mut self) {
+        let Some(slider_id) = self.dragging_slider else {
+            return;
+        };
+        let Some(win) = self
+            .windows
+            .iter()
+            .rev()
+            .find(|w| w.subsystem == WboSubsystem::Settings && !w.minimized)
+        else {
+            return;
+        };
+        let client = win.client_rect();
+        let track_x = client.x + 20;
+        let track_w = (client.w - 40).max(40);
+        let rel = (self.mouse_x - track_x).clamp(0, track_w);
+
+        if slider_id == 1 {
+            let pct = 20 + ((rel * 80) / track_w) as u8;
+            self.brightness = pct.clamp(20, 100);
+            self.persist_settings();
+        } else if slider_id == 2 {
+            let pct = ((rel * 100) / track_w) as u8;
+            self.volume = pct.clamp(0, 100);
+            self.persist_settings();
+        }
+    }
+
     pub fn on_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse_x = x.clamp(0, FB_WIDTH as i32 - 1);
         self.mouse_y = y.clamp(0, FB_HEIGHT as i32 - 1);
+
+        if self.dragging_slider.is_some() {
+            self.update_settings_slider_from_mouse();
+            return;
+        }
 
         if let Some(drag_id) = self.dragging_win_id {
             if let Some(win) = self.windows.iter_mut().find(|w| w.id == drag_id) {
@@ -339,29 +416,59 @@ impl Kernel {
         Rect::new(FB_WIDTH as i32 - 122, FB_HEIGHT as i32 - TASKBAR_H + 6, 112, TASKBAR_H - 12)
     }
 
-    fn desktop_shortcuts(&self) -> [(&'static str, &'static str, IconKind); 5] {
+    fn reset_modal_rect(&self) -> Rect {
+        let w = 440;
+        let h = 220;
+        Rect::new((FB_WIDTH as i32 - w) / 2, (FB_HEIGHT as i32 - h) / 2 - 20, w, h)
+    }
+
+    fn desktop_shortcuts(&self) -> [(&'static str, &'static str, IconKind); 6] {
         [
             ("Terminal", "C:/WebOS/bin/Apps/Terminal.wbo", IconKind::Terminal),
             ("Editor", "C:/WebOS/bin/Apps/Editor.wbo", IconKind::Editor),
             ("Files", "C:/WebOS/bin/Apps/Files.wbo", IconKind::Files),
+            ("Settings", "C:/WebOS/bin/Apps/Settings.wbo", IconKind::Settings),
             ("Counter", "C:/WebOS/bin/Apps/Counter.wbo", IconKind::AppBinary),
             ("Arcade", "C:/WebOS/bin/Apps/Arcade_Runner.wbo", IconKind::AppBinary),
         ]
     }
 
-    pub fn on_mouse_down(&mut self, x: i32, y: i32, button: u32) {
+    pub fn on_mouse_down(&mut self, x: i32, y: i32, button: u32, hw: &dyn Hardware) {
         self.on_mouse_move(x, y);
         if button != 0 {
             return;
         }
 
-        // 1. Bottom-right WebOS Launcher Button
+        if self.reset_modal_stage > 0 {
+            let mrect = self.reset_modal_rect();
+            let cancel_btn = Rect::new(mrect.x + mrect.w - 236, mrect.y + mrect.h - 46, 98, 30);
+            let confirm_btn = Rect::new(mrect.x + mrect.w - 126, mrect.y + mrect.h - 46, 108, 30);
+
+            if cancel_btn.contains(x, y) || !mrect.contains(x, y) {
+                self.reset_modal_stage = 0;
+                self.reset_input.clear();
+                return;
+            }
+
+            if self.reset_modal_stage == 1 {
+                if confirm_btn.contains(x, y) {
+                    self.reset_modal_stage = 2;
+                    self.reset_input.clear();
+                }
+            } else if self.reset_modal_stage == 2 {
+                let exact_match = self.reset_input == FACTORY_RESET_PHRASE;
+                if exact_match && confirm_btn.contains(x, y) {
+                    hw.factory_reset();
+                }
+            }
+            return;
+        }
+
         if self.launcher_btn_rect().contains(x, y) {
             self.toggle_launcher();
             return;
         }
 
-        // 2. Launcher Popup
         if self.launcher_open {
             let lrect = self.launcher_rect();
             if lrect.contains(x, y) {
@@ -381,7 +488,6 @@ impl Kernel {
             }
         }
 
-        // 3. Taskbar running app tabs
         if y >= FB_HEIGHT as i32 - TASKBAR_H {
             let btn_y = FB_HEIGHT as i32 - TASKBAR_H + 6;
             let btn_h = TASKBAR_H - 12;
@@ -415,7 +521,6 @@ impl Kernel {
             return;
         }
 
-        // 4. Hit-test visible open windows from top to bottom
         let mut hit: Option<(usize, WboSubsystem, (i32, i32), Rect, bool, bool, bool, bool, bool)> =
             None;
         for win in self.windows.iter().rev() {
@@ -503,19 +608,44 @@ impl Kernel {
                     WboSubsystem::Files => self.handle_files_click(x, y, client),
                     WboSubsystem::Editor => self.handle_editor_click(x, y, client),
                     WboSubsystem::DeclarativeApp => self.handle_declarative_click(x, y, client),
+                    WboSubsystem::Settings => self.handle_settings_click(x, y, client),
                     _ => {}
                 }
             }
             return;
         }
 
-        // 5. Desktop shortcut icons
         for (idx, (_, exe_path, _)) in self.desktop_shortcuts().iter().enumerate() {
             let icon_rect = Rect::new(18, 22 + (idx as i32) * 78, 76, 66);
             if icon_rect.contains(x, y) {
                 let _ = self.exec_wbo(exe_path, None);
                 return;
             }
+        }
+    }
+
+    fn handle_settings_click(&mut self, x: i32, y: i32, client: Rect) {
+        let track_x = client.x + 20;
+        let track_w = (client.w - 40).max(40);
+
+        let bright_hit = Rect::new(track_x - 8, client.y + 44, track_w + 16, 26);
+        if bright_hit.contains(x, y) {
+            self.dragging_slider = Some(1);
+            self.update_settings_slider_from_mouse();
+            return;
+        }
+
+        let vol_hit = Rect::new(track_x - 8, client.y + 114, track_w + 16, 26);
+        if vol_hit.contains(x, y) {
+            self.dragging_slider = Some(2);
+            self.update_settings_slider_from_mouse();
+            return;
+        }
+
+        let reset_btn = Rect::new(client.x + 20, client.y + 220, 176, 32);
+        if reset_btn.contains(x, y) {
+            self.reset_modal_stage = 1;
+            self.reset_input.clear();
         }
     }
 
@@ -635,7 +765,6 @@ impl Kernel {
             return;
         }
 
-        // Click inside code area to position cursor (accounting for scroll_x & scroll_y)
         let text_top = client.y + 38;
         let text_left = client.x + 52;
         if y >= text_top && y < client.y + client.h - 24 && x >= text_left {
@@ -727,10 +856,46 @@ impl Kernel {
         if button == 0 {
             self.dragging_win_id = None;
             self.resizing_win_id = None;
+            self.dragging_slider = None;
         }
     }
 
     pub fn on_key(&mut self, code: u32, hw: &dyn Hardware) {
+        if self.reset_modal_stage > 0 {
+            match code {
+                27 => {
+                    self.reset_modal_stage = 0;
+                    self.reset_input.clear();
+                }
+                13 => {
+                    if self.reset_modal_stage == 1 {
+                        self.reset_modal_stage = 2;
+                        self.reset_input.clear();
+                    } else if self.reset_modal_stage == 2
+                        && self.reset_input == FACTORY_RESET_PHRASE
+                    {
+                        hw.factory_reset();
+                    }
+                }
+                8 => {
+                    if self.reset_modal_stage == 2 {
+                        self.reset_input.pop();
+                    }
+                }
+                32..=126 => {
+                    if self.reset_modal_stage == 2 {
+                        if let Some(ch) = char::from_u32(code) {
+                            if self.reset_input.len() < 32 {
+                                self.reset_input.push(ch);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if code == 1005 {
             self.toggle_launcher();
             return;
@@ -826,7 +991,6 @@ impl Kernel {
         };
 
         match code {
-            // Vertical Wheel Up / Down
             1010 => {
                 ed.scroll_y = ed.scroll_y.saturating_sub(2);
                 return;
@@ -837,7 +1001,6 @@ impl Kernel {
                 }
                 return;
             }
-            // Horizontal Wheel Left / Right
             1012 => {
                 ed.scroll_x = ed.scroll_x.saturating_sub(4);
                 return;
@@ -846,21 +1009,18 @@ impl Kernel {
                 ed.scroll_x += 4;
                 return;
             }
-            // ArrowUp
             1001 => {
                 if ed.cursor_line > 0 {
                     ed.cursor_line -= 1;
                     ed.cursor_col = ed.cursor_col.min(char_len(&ed.lines[ed.cursor_line]));
                 }
             }
-            // ArrowDown
             1002 => {
                 if ed.cursor_line + 1 < ed.lines.len() {
                     ed.cursor_line += 1;
                     ed.cursor_col = ed.cursor_col.min(char_len(&ed.lines[ed.cursor_line]));
                 }
             }
-            // ArrowLeft
             1003 => {
                 if ed.cursor_col > 0 {
                     ed.cursor_col -= 1;
@@ -869,7 +1029,6 @@ impl Kernel {
                     ed.cursor_col = char_len(&ed.lines[ed.cursor_line]);
                 }
             }
-            // ArrowRight
             1004 => {
                 if ed.cursor_col < char_len(&ed.lines[ed.cursor_line]) {
                     ed.cursor_col += 1;
@@ -880,7 +1039,6 @@ impl Kernel {
             }
             1008 => ed.cursor_col = 0,
             1009 => ed.cursor_col = char_len(&ed.lines[ed.cursor_line]),
-            // Enter
             13 => {
                 let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                 let tail = ed.lines[ed.cursor_line].split_off(b_idx);
@@ -888,7 +1046,6 @@ impl Kernel {
                 ed.lines.insert(ed.cursor_line, tail);
                 ed.cursor_col = 0;
             }
-            // Backspace
             8 => {
                 if ed.cursor_col > 0 {
                     ed.cursor_col -= 1;
@@ -901,7 +1058,6 @@ impl Kernel {
                     ed.lines[ed.cursor_line].push_str(&current);
                 }
             }
-            // Delete
             127 => {
                 if ed.cursor_col < char_len(&ed.lines[ed.cursor_line]) {
                     let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
@@ -911,13 +1067,11 @@ impl Kernel {
                     ed.lines[ed.cursor_line].push_str(&next);
                 }
             }
-            // Tab -> 4 spaces
             9 => {
                 let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
                 ed.lines[ed.cursor_line].insert_str(b_idx, "    ");
                 ed.cursor_col += 4;
             }
-            // Printable ASCII
             32..=126 => {
                 if let Some(ch) = char::from_u32(code) {
                     let b_idx = char_to_byte_idx(&ed.lines[ed.cursor_line], ed.cursor_col);
@@ -1270,6 +1424,7 @@ impl Kernel {
             WboSubsystem::SysMon => IconKind::SysMon,
             WboSubsystem::Editor => IconKind::Editor,
             WboSubsystem::DeclarativeApp => IconKind::AppBinary,
+            WboSubsystem::Settings => IconKind::Settings,
         }
     }
 
@@ -1454,13 +1609,13 @@ impl Kernel {
         let elapsed_ms = now_ms.saturating_sub(self.boot_time_ms);
         let blink_on = (now_ms / 500) % 2 == 0;
 
-        // Advance timers for running DeclarativeApps
         for win in &mut self.windows {
             if let Some(rt) = win.runtime.as_mut() {
                 rt.tick(now_ms);
             }
         }
         self.flush_runtime_effects();
+        self.sync_persistence(hw);
 
         let top_win_id = self
             .windows
@@ -1497,17 +1652,21 @@ impl Kernel {
         };
         let launcher_rect = self.launcher_rect();
         let launcher_btn = self.launcher_btn_rect();
+        let modal_rect = self.reset_modal_rect();
         let shortcuts = self.desktop_shortcuts();
         let mx = self.mouse_x;
         let my = self.mouse_y;
+        let brightness = self.brightness;
+        let volume = self.volume;
+        let reset_stage = self.reset_modal_stage;
+        let reset_input = self.reset_input.clone();
 
         let mut canvas = Canvas::new(&mut self.framebuffer);
 
-        // 1. Desktop Wallpaper & Shortcut Icons
         canvas.draw_wallpaper();
         for (idx, (label, _, icon)) in shortcuts.iter().enumerate() {
             let srect = Rect::new(18, 22 + (idx as i32) * 78, 76, 66);
-            if srect.contains(mx, my) {
+            if srect.contains(mx, my) && reset_stage == 0 {
                 canvas.fill_rect_alpha(srect, rgba(0, 120, 215), 40);
                 canvas.stroke_rect(srect, rgba(0, 120, 215));
             }
@@ -1522,20 +1681,21 @@ impl Kernel {
             );
         }
 
-        // 2. Render Visible Running Windows
         let total_windows = self.windows.len();
         for win in &mut self.windows {
             if win.minimized {
                 continue;
             }
-            let is_focused = Some(win.id) == top_win_id;
+            let is_focused = Some(win.id) == top_win_id && reset_stage == 0;
             let frame = win.frame_rect();
             let close_btn = win.close_btn_rect();
             let max_btn = win.max_btn_rect();
             let min_btn = win.min_btn_rect();
             let client = win.client_rect();
 
-            let hover_btn = if close_btn.contains(mx, my) {
+            let hover_btn = if reset_stage > 0 {
+                0
+            } else if close_btn.contains(mx, my) {
                 3
             } else if max_btn.contains(mx, my) {
                 2
@@ -1751,7 +1911,6 @@ impl Kernel {
                         let visible_rows = ((client.h - 60).max(20) as usize) / CHAR_H;
                         let visible_cols = ((client.w - 58).max(40) as usize) / CHAR_W;
 
-                        // Line Number Gutter
                         canvas.fill_rect(
                             Rect::new(client.x, client.y + 32, 46, client.h - 56),
                             rgba(16, 21, 29),
@@ -1796,7 +1955,6 @@ impl Kernel {
                             canvas.draw_text(client.x + 52, py, &visible_slice, col_fg, bg);
                         }
 
-                        // Blinking Text Cursor (respecting scroll_x and scroll_y)
                         if is_focused
                             && blink_on
                             && ed.cursor_line >= ed.scroll_y
@@ -1811,7 +1969,6 @@ impl Kernel {
                             canvas.fill_rect(Rect::new(cx, cy, 2, 16), rgba(88, 242, 132));
                         }
 
-                        // Status Footer
                         let status_y = client.y + client.h - 24;
                         canvas.fill_rect(Rect::new(client.x, status_y, client.w, 24), bar_bg);
                         let st_col = if ed.status.starts_with("Syntax")
@@ -1879,9 +2036,78 @@ impl Kernel {
                     canvas.draw_text(
                         client.x + 14,
                         client.y + 108,
-                        "Exe Format: WBO\\x02 (WBML v2 Layout + VM)",
+                        "Persistence: localStorage (WBFS\x01)",
                         rgba(121, 192, 255),
                         panel_bg,
+                    );
+                }
+                WboSubsystem::Settings => {
+                    let panel_bg = rgba(15, 20, 29);
+                    canvas.fill_rect(client, panel_bg);
+
+                    let track_x = client.x + 20;
+                    let track_w = (client.w - 40).max(40);
+
+                    canvas.draw_text(
+                        client.x + 20,
+                        client.y + 18,
+                        &format!("Display Brightness: {}%", brightness),
+                        rgba(230, 237, 243),
+                        panel_bg,
+                    );
+                    let b_track = Rect::new(track_x, client.y + 52, track_w, 6);
+                    canvas.fill_rect(b_track, rgba(10, 14, 20));
+                    canvas.stroke_rect(b_track, rgba(48, 54, 61));
+                    let b_fill = (((brightness.saturating_sub(20) as i32) * track_w) / 80).clamp(0, track_w);
+                    canvas.fill_rect(
+                        Rect::new(b_track.x, b_track.y, b_fill.max(4), b_track.h),
+                        rgba(0, 120, 215),
+                    );
+                    canvas.fill_circle(b_track.x + b_fill, b_track.y + 3, 7, rgba(240, 246, 252));
+
+                    canvas.draw_text(
+                        client.x + 20,
+                        client.y + 88,
+                        &format!("Master Volume: {}% (No Audio Driver)", volume),
+                        rgba(230, 237, 243),
+                        panel_bg,
+                    );
+                    let v_track = Rect::new(track_x, client.y + 122, track_w, 6);
+                    canvas.fill_rect(v_track, rgba(10, 14, 20));
+                    canvas.stroke_rect(v_track, rgba(48, 54, 61));
+                    let v_fill = (((volume as i32) * track_w) / 100).clamp(0, track_w);
+                    canvas.fill_rect(
+                        Rect::new(v_track.x, v_track.y, v_fill.max(4), v_track.h),
+                        rgba(88, 166, 255),
+                    );
+                    canvas.fill_circle(v_track.x + v_fill, v_track.y + 3, 7, rgba(240, 246, 252));
+
+                    canvas.fill_rect(
+                        Rect::new(client.x + 20, client.y + 158, track_w, 1),
+                        rgba(48, 54, 61),
+                    );
+                    canvas.draw_text(
+                        client.x + 20,
+                        client.y + 174,
+                        "Storage & System Recovery",
+                        rgba(255, 123, 114),
+                        panel_bg,
+                    );
+                    canvas.draw_text_scaled(
+                        client.x + 20,
+                        client.y + 198,
+                        "Wipes all saved files, apps & settings.",
+                        rgba(139, 148, 158),
+                        1,
+                    );
+
+                    let reset_btn = Rect::new(client.x + 20, client.y + 220, 176, 32);
+                    canvas.draw_win10_button(
+                        reset_btn,
+                        "Factory Reset...",
+                        reset_btn.contains(mx, my) && reset_stage == 0,
+                        false,
+                        rgba(255, 123, 114),
                     );
                 }
                 WboSubsystem::DeclarativeApp => {
@@ -1902,7 +2128,6 @@ impl Kernel {
                 }
             }
 
-            // Bottom-right window resize grip indicator
             if !win.maximized {
                 canvas.reset_clip();
                 let gx = win.x + win.w - 10;
@@ -1912,7 +2137,6 @@ impl Kernel {
             }
         }
 
-        // 3. Bottom-Right Searchable WebOS Launcher Popup
         if self.launcher_open {
             canvas.reset_clip();
             let l_bg = rgba(20, 26, 36);
@@ -1968,6 +2192,7 @@ impl Kernel {
                     "Files" => IconKind::Files,
                     "Editor" => IconKind::Editor,
                     "SysMon" => IconKind::SysMon,
+                    "Settings" => IconKind::Settings,
                     _ => IconKind::AppBinary,
                 };
                 canvas.draw_icon(row_rect.x + 8, row_rect.y + 5, icon);
@@ -1981,7 +2206,6 @@ impl Kernel {
             }
         }
 
-        // 4. Bottom Windows 10 Taskbar
         canvas.reset_clip();
         let tb_y = FB_HEIGHT as i32 - TASKBAR_H;
         let tb_bg = rgba(16, 20, 26);
@@ -2048,7 +2272,139 @@ impl Kernel {
             wb_bg,
         );
 
-        // 5. Mouse Cursor
+        if reset_stage > 0 {
+            canvas.reset_clip();
+            canvas.fill_rect_alpha(
+                Rect::new(0, 0, FB_WIDTH as i32, FB_HEIGHT as i32),
+                rgba(4, 6, 10),
+                170,
+            );
+
+            let m_bg = rgba(20, 25, 34);
+            canvas.fill_rect(modal_rect, m_bg);
+            canvas.stroke_rect(modal_rect, rgba(218, 54, 51));
+            canvas.fill_rect(
+                Rect::new(modal_rect.x, modal_rect.y, modal_rect.w, 32),
+                rgba(38, 22, 26),
+            );
+            canvas.draw_text(
+                modal_rect.x + 14,
+                modal_rect.y + 8,
+                "WebOS Factory Reset",
+                rgba(255, 123, 114),
+                rgba(38, 22, 26),
+            );
+
+            let cancel_btn =
+                Rect::new(modal_rect.x + modal_rect.w - 236, modal_rect.y + modal_rect.h - 46, 98, 30);
+            let confirm_btn =
+                Rect::new(modal_rect.x + modal_rect.w - 126, modal_rect.y + modal_rect.h - 46, 108, 30);
+
+            canvas.draw_win10_button(
+                cancel_btn,
+                "Cancel",
+                cancel_btn.contains(mx, my),
+                false,
+                rgba(230, 237, 243),
+            );
+
+            if reset_stage == 1 {
+                canvas.draw_text(
+                    modal_rect.x + 18,
+                    modal_rect.y + 52,
+                    "Are you sure you want to reset WebOS?",
+                    rgba(240, 246, 252),
+                    m_bg,
+                );
+                canvas.draw_text_scaled(
+                    modal_rect.x + 18,
+                    modal_rect.y + 84,
+                    "This will permanently erase all saved files,",
+                    rgba(150, 162, 178),
+                    1,
+                );
+                canvas.draw_text_scaled(
+                    modal_rect.x + 18,
+                    modal_rect.y + 100,
+                    "custom apps, and system settings.",
+                    rgba(150, 162, 178),
+                    1,
+                );
+
+                canvas.draw_win10_button(
+                    confirm_btn,
+                    "Continue",
+                    confirm_btn.contains(mx, my),
+                    true,
+                    rgba(255, 255, 255),
+                );
+            } else {
+                canvas.draw_text_scaled(
+                    modal_rect.x + 18,
+                    modal_rect.y + 46,
+                    "Type exact phrase to confirm:",
+                    rgba(201, 209, 217),
+                    1,
+                );
+                canvas.draw_text(
+                    modal_rect.x + 18,
+                    modal_rect.y + 64,
+                    FACTORY_RESET_PHRASE,
+                    rgba(255, 166, 87),
+                    m_bg,
+                );
+
+                let box_rect = Rect::new(modal_rect.x + 18, modal_rect.y + 96, modal_rect.w - 36, 32);
+                let box_bg = rgba(10, 14, 20);
+                let exact_match = reset_input == FACTORY_RESET_PHRASE;
+                canvas.fill_rect(box_rect, box_bg);
+                canvas.stroke_rect(
+                    box_rect,
+                    if exact_match {
+                        rgba(88, 242, 132)
+                    } else {
+                        rgba(0, 120, 215)
+                    },
+                );
+                canvas.draw_text(
+                    box_rect.x + 10,
+                    box_rect.y + 7,
+                    &reset_input,
+                    rgba(240, 246, 252),
+                    box_bg,
+                );
+                if blink_on {
+                    let cx = box_rect.x + 10 + (reset_input.chars().count() * CHAR_W) as i32;
+                    canvas.fill_rect(Rect::new(cx, box_rect.y + 7, 2, 17), rgba(0, 120, 215));
+                }
+
+                if exact_match {
+                    let btn_bg = if confirm_btn.contains(mx, my) {
+                        rgba(242, 72, 68)
+                    } else {
+                        rgba(218, 54, 51)
+                    };
+                    canvas.fill_rect(confirm_btn, btn_bg);
+                    canvas.stroke_rect(confirm_btn, rgba(255, 123, 114));
+                    let lbl = "Factory Reset";
+                    let tx = confirm_btn.x
+                        + (confirm_btn.w - (lbl.chars().count() as i32 * 6)) / 2;
+                    let ty = confirm_btn.y + (confirm_btn.h - 7) / 2;
+                    canvas.draw_text_scaled(tx.max(confirm_btn.x + 4), ty, lbl, rgba(255, 255, 255), 1);
+                } else {
+                    let dim_bg = rgba(28, 32, 40);
+                    canvas.fill_rect(confirm_btn, dim_bg);
+                    canvas.stroke_rect(confirm_btn, rgba(48, 54, 61));
+                    let lbl = "Factory Reset";
+                    let tx = confirm_btn.x
+                        + (confirm_btn.w - (lbl.chars().count() as i32 * 6)) / 2;
+                    let ty = confirm_btn.y + (confirm_btn.h - 7) / 2;
+                    canvas.draw_text_scaled(tx.max(confirm_btn.x + 4), ty, lbl, rgba(95, 104, 116), 1);
+                }
+            }
+        }
+
+        canvas.apply_brightness(brightness);
         canvas.draw_cursor(self.mouse_x, self.mouse_y);
     }
 

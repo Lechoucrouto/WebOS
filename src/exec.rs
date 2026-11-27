@@ -14,6 +14,7 @@ pub enum WboSubsystem {
     SysMon = 3,
     Editor = 4,
     DeclarativeApp = 5,
+    Settings = 6,
 }
 
 impl WboSubsystem {
@@ -24,6 +25,7 @@ impl WboSubsystem {
             3 => Some(Self::SysMon),
             4 => Some(Self::Editor),
             5 => Some(Self::DeclarativeApp),
+            6 => Some(Self::Settings),
             _ => None,
         }
     }
@@ -1748,6 +1750,10 @@ pub fn install_system_binaries(fs: &mut FileSystem) {
     let _ = fs.write_bytes(
         "C:/WebOS/bin/Apps/Editor.wbo",
         WboExecutable::pack_system(WboSubsystem::Editor, 960, 520, "Code Editor"),
+    );
+    let _ = fs.write_bytes(
+        "C:/WebOS/bin/Apps/Settings.wbo",
+        WboExecutable::pack_system(WboSubsystem::Settings, 460, 340, "Settings"),
     );
 
     for (src, out) in [

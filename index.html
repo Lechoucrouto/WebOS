@@ -52,6 +52,24 @@
     async function boot() {
       let wasmMemory;
       const decoder = new TextDecoder("utf-8");
+      const STORAGE_KEY = "webos_fs_v1";
+
+      function bytesToBase64(bytes) {
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++) {
+          bin += String.fromCharCode(bytes[i]);
+        }
+        return btoa(bin);
+      }
+
+      function base64ToBytes(b64) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+          bytes[i] = bin.charCodeAt(i);
+        }
+        return bytes;
+      }
 
       const importObject = {
         env: {
@@ -60,11 +78,62 @@
             const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
             console.log(decoder.decode(bytes));
           },
+          js_storage_save: (ptr, len) => {
+            try {
+              const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
+              localStorage.setItem(STORAGE_KEY, bytesToBase64(bytes));
+            } catch (err) {
+              console.warn("WebOS storage save failed:", err);
+            }
+          },
+          js_storage_len: () => {
+            try {
+              const raw = localStorage.getItem(STORAGE_KEY);
+              if (!raw) return 0;
+              return base64ToBytes(raw).length;
+            } catch (_) {
+              return 0;
+            }
+          },
+          js_storage_read: (ptr, maxLen) => {
+            try {
+              const raw = localStorage.getItem(STORAGE_KEY);
+              if (!raw) return 0;
+              const bytes = base64ToBytes(raw);
+              const count = Math.min(bytes.length, maxLen);
+              new Uint8Array(wasmMemory.buffer, ptr, count).set(bytes.subarray(0, count));
+              return count;
+            } catch (_) {
+              return 0;
+            }
+          },
+          js_factory_reset: async () => {
+            try {
+              localStorage.clear();
+              sessionStorage.clear();
+              if (window.indexedDB && indexedDB.databases) {
+                const dbs = await indexedDB.databases();
+                for (const db of dbs) {
+                  if (db.name) indexedDB.deleteDatabase(db.name);
+                }
+              }
+              if (window.caches) {
+                const keys = await caches.keys();
+                await Promise.all(keys.map((k) => caches.delete(k)));
+              }
+            } catch (_) {}
+
+            const url = new URL(window.location.href);
+            url.searchParams.set("reset", Date.now().toString());
+            window.location.replace(url.toString());
+          },
         },
       };
 
       const { instance } = await WebAssembly.instantiateStreaming(
-        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=6"),
+        fetch("./target/wasm32-unknown-unknown/release/webos.wasm?v=" + Date.now(), {
+          cache: "no-store",
+        }),
         importObject
       );
 

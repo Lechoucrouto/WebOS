@@ -3,13 +3,15 @@
 extern crate alloc;
 
 mod allocator;
-mod font;
-mod gui;
-mod fs;
 mod exec;
+mod font;
+mod fs;
+mod gui;
 mod hal;
 mod kernel;
 
+use alloc::vec;
+use alloc::vec::Vec;
 use allocator::LinkedListAllocator;
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
@@ -24,6 +26,10 @@ static ALLOCATOR: LinkedListAllocator = LinkedListAllocator::new();
 extern "C" {
     fn js_now_ms() -> f64;
     fn js_console_log(ptr: *const u8, len: usize);
+    fn js_storage_save(ptr: *const u8, len: usize);
+    fn js_storage_len() -> usize;
+    fn js_storage_read(ptr: *mut u8, max_len: usize) -> usize;
+    fn js_factory_reset();
 }
 
 struct BrowserHal;
@@ -36,6 +42,31 @@ impl Hardware for BrowserHal {
     fn serial_log(&self, msg: &str) {
         unsafe {
             js_console_log(msg.as_ptr(), msg.len());
+        }
+    }
+
+    fn storage_save(&self, data: &[u8]) {
+        unsafe {
+            js_storage_save(data.as_ptr(), data.len());
+        }
+    }
+
+    fn storage_load(&self) -> Option<Vec<u8>> {
+        unsafe {
+            let len = js_storage_len();
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            let read = js_storage_read(buf.as_mut_ptr(), len);
+            buf.truncate(read);
+            Some(buf)
+        }
+    }
+
+    fn factory_reset(&self) {
+        unsafe {
+            js_factory_reset();
         }
     }
 }
@@ -79,7 +110,7 @@ pub extern "C" fn kernel_mouse_move(x: i32, y: i32) {
 
 #[no_mangle]
 pub extern "C" fn kernel_mouse_down(x: i32, y: i32, button: u32) {
-    with_kernel(|k| k.on_mouse_down(x, y, button));
+    with_kernel(|k| k.on_mouse_down(x, y, button, &BrowserHal));
 }
 
 #[no_mangle]

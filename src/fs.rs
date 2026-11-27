@@ -11,6 +11,7 @@ pub enum FsNode {
 pub struct FileSystem {
     nodes: BTreeMap<String, FsNode>,
     pub cwd: String,
+    pub dirty: bool,
 }
 
 impl FileSystem {
@@ -18,6 +19,7 @@ impl FileSystem {
         let mut fs = Self {
             nodes: BTreeMap::new(),
             cwd: String::from("C:/usr"),
+            dirty: false,
         };
 
         fs.nodes.insert(String::from("C:/"), FsNode::Dir);
@@ -29,7 +31,7 @@ impl FileSystem {
 
         let _ = fs.write_str(
             "C:/usr/readme.txt",
-            "Welcome to WebOS v0.5.0!\n- Open any .wbml file in Code Editor for a LIVE side-by-side preview.\n- Try counter.wbml, calculator.wbml, or snake.wbml in C:/usr/!",
+            "Welcome to WebOS v0.6.0!\n- All files in C:/usr/ and Settings now persist in browser storage.\n- Open Settings to adjust Brightness, Volume, or perform a Factory Reset.",
         );
 
         let _ = fs.write_str(
@@ -178,6 +180,7 @@ impl FileSystem {
             "# Sample WebOS shell script\necho Running hello.wbsh from C:/usr/\n@sys.mem\n",
         );
 
+        fs.dirty = false;
         fs
     }
 
@@ -234,6 +237,7 @@ impl FileSystem {
         match self.nodes.get(&parent) {
             Some(FsNode::Dir) => {
                 self.nodes.insert(resolved, FsNode::Dir);
+                self.dirty = true;
                 Ok(())
             }
             _ => Err("Parent directory does not exist"),
@@ -252,6 +256,7 @@ impl FileSystem {
         match self.nodes.get(&parent) {
             Some(FsNode::Dir) => {
                 self.nodes.insert(resolved, FsNode::File(data));
+                self.dirty = true;
                 Ok(())
             }
             _ => Err("Parent directory does not exist"),
@@ -289,6 +294,7 @@ impl FileSystem {
             None => Err("No such file or directory"),
             Some(FsNode::File(_)) => {
                 self.nodes.remove(&resolved);
+                self.dirty = true;
                 Ok(())
             }
             Some(FsNode::Dir) => {
@@ -298,6 +304,7 @@ impl FileSystem {
                     Err("Directory is not empty")
                 } else {
                     self.nodes.remove(&resolved);
+                    self.dirty = true;
                     Ok(())
                 }
             }
@@ -340,5 +347,105 @@ impl FileSystem {
             Some(idx) => resolved_path[..idx].to_string(),
             None => String::from("C:/"),
         }
+    }
+
+    pub fn export_persistent_blob(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"WBFS\x01");
+
+        let mut records: Vec<(&String, &FsNode)> = self
+            .nodes
+            .iter()
+            .filter(|(k, _)| {
+                k.starts_with("C:/usr/")
+                    || *k == "C:/WebOS/settings.cfg"
+                    || (k.starts_with("C:/WebOS/bin/Apps/")
+                        && !matches!(
+                            k.as_str(),
+                            "C:/WebOS/bin/Apps/Terminal.wbo"
+                                | "C:/WebOS/bin/Apps/Files.wbo"
+                                | "C:/WebOS/bin/Apps/SysMon.wbo"
+                                | "C:/WebOS/bin/Apps/Editor.wbo"
+                                | "C:/WebOS/bin/Apps/Settings.wbo"
+                        ))
+            })
+            .collect();
+
+        records.sort_by_key(|(k, _)| k.len());
+
+        let count = records.len() as u32;
+        out.extend_from_slice(&count.to_le_bytes());
+
+        for (path, node) in records {
+            let pbytes = path.as_bytes();
+            let plen = pbytes.len().min(u16::MAX as usize) as u16;
+            match node {
+                FsNode::Dir => {
+                    out.push(0);
+                    out.extend_from_slice(&plen.to_le_bytes());
+                    out.extend_from_slice(&pbytes[..plen as usize]);
+                }
+                FsNode::File(data) => {
+                    out.push(1);
+                    out.extend_from_slice(&plen.to_le_bytes());
+                    out.extend_from_slice(&pbytes[..plen as usize]);
+                    let dlen = data.len() as u32;
+                    out.extend_from_slice(&dlen.to_le_bytes());
+                    out.extend_from_slice(data);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn import_persistent_blob(&mut self, blob: &[u8]) -> bool {
+        if blob.len() < 9 || &blob[0..5] != b"WBFS\x01" {
+            return false;
+        }
+        let count = u32::from_le_bytes([blob[5], blob[6], blob[7], blob[8]]) as usize;
+        let mut cur = 9usize;
+
+        self.nodes.retain(|k, _| !k.starts_with("C:/usr/"));
+
+        for _ in 0..count {
+            if cur + 3 > blob.len() {
+                return false;
+            }
+            let kind = blob[cur];
+            let plen = u16::from_le_bytes([blob[cur + 1], blob[cur + 2]]) as usize;
+            cur += 3;
+            if cur + plen > blob.len() {
+                return false;
+            }
+            let Ok(path_str) = core::str::from_utf8(&blob[cur..cur + plen]) else {
+                return false;
+            };
+            cur += plen;
+
+            if kind == 0 {
+                self.nodes.insert(path_str.to_string(), FsNode::Dir);
+            } else if kind == 1 {
+                if cur + 4 > blob.len() {
+                    return false;
+                }
+                let dlen = u32::from_le_bytes([
+                    blob[cur],
+                    blob[cur + 1],
+                    blob[cur + 2],
+                    blob[cur + 3],
+                ]) as usize;
+                cur += 4;
+                if cur + dlen > blob.len() {
+                    return false;
+                }
+                self.nodes
+                    .insert(path_str.to_string(), FsNode::File(blob[cur..cur + dlen].to_vec()));
+                cur += dlen;
+            } else {
+                return false;
+            }
+        }
+        self.dirty = false;
+        true
     }
 }
